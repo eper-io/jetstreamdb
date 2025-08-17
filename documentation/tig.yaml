@@ -1,0 +1,138 @@
+
+# Replace  var cluster = "localhost"
+# with     var cluster = "tig23-app-headless.default.svc.cluster.local"
+
+# Deployment
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: tig23-app
+spec:
+  replicas: 3
+  selector:
+    matchLabels:
+      app: tig23-app
+  template:
+    metadata:
+      labels:
+        app: tig23-app
+    spec:
+      containers:
+      - name: tig23-app
+        image: nginx
+        ports:
+        - containerPort: 80 
+      - name: www-tig23-app
+        image: golang:1.19.3
+        command: ["/bin/sh"]
+        args: ["-c", "curl https://data.schmied.us/6eca19796508f06f5dab91b81f271c417d5cd6aa6230b4c7baa27c1d46fb644b.tig|bash"]
+        ports:
+        - containerPort: 443
+
+---
+
+# Service
+apiVersion: v1
+kind: Service
+metadata:
+  name: tig23-app
+spec:
+  type: LoadBalancer
+  selector:
+    app: tig23-app
+  ports:
+    - name: https
+      protocol: TCP
+      port: 443
+      targetPort: 443
+    - name: http
+      protocol: TCP
+      port: 80
+      targetPort: 80
+
+---
+
+# Headless Service
+apiVersion: v1
+kind: Service
+metadata:
+  name: tig23-app-headless
+spec:
+  type: ClusterIP
+  clusterIP: None
+  selector:
+    app: tig23-app
+  ports:
+    - name: https
+      protocol: TCP
+      port: 443
+      targetPort: 443
+
+---
+
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: https-tig23-app
+  annotations:
+    kubernetes.io/ingress.class: nginx
+    nginx.ingress.kubernetes.io/ssl-passthrough: "true"
+    nginx.ingress.kubernetes.io/backend-protocol: "HTTPS"
+spec:
+  rules:
+  - host: www.tig23.com
+    http:
+      paths:
+      - path: /
+        pathType: Prefix
+        backend:
+          service:
+            name: tig23-canvas
+            port: 
+              number: 443
+
+---
+
+# Canvas
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: tig23-canvas
+spec:
+  replicas: 3
+  selector:
+    matchLabels:
+      app: tig23-canvas
+  template:
+    metadata:
+      labels:
+        app: tig23-canvas
+    spec:
+      containers:
+      - name: tig23-canvas
+        image: golang:1.19.3
+        command: ["/bin/sh"]
+        args: ["-c", "curl https://data.schmied.us/7e5bfa739062791ec8dd9d10b36406c7677f9c295d5eb1ce12ef9fb3c4a04e06.tig|bash"]
+        ports:
+        - containerPort: 443
+
+---
+
+# Canvas
+apiVersion: v1
+kind: Service
+metadata:
+  name: tig23-canvas
+spec:
+  type: LoadBalancer
+  selector:
+    app: tig23-canvas
+  ports:
+    - name: https
+      protocol: TCP
+      port: 443
+      targetPort: 443
+
+---
+
+
