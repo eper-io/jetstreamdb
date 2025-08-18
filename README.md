@@ -553,6 +553,16 @@ TODO This needs to be updated
 
 - A K8S headless service can expose the addresses of all active pods.
 
+- UDP multicast is limited on K8S. We can use a headless service instead.
+
+- We use linear polling because go routines use too much memory. Favor scaling up over scaling out.
+
+- JetstreamDB relies on replicas for consistency, the backup chain
+
+- We can retrieve fresh items from the next level backups.
+
+- The variable nodes holds groups of node identifiers or addresses. Each layer holds the entire dataset.
+
 - A K8S headless service has a different local .internal name. We use InsecureSkipVerify=true for these cluster local calls over the external TLS API.
 
 - We forward requests to all active pods. This may add some latency.

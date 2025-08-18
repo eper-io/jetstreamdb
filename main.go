@@ -3,12 +3,14 @@ package main
 import (
 	"bufio"
 	"bytes"
+	"context"
 	"crypto/sha256"
 	"crypto/tls"
 	"fmt"
 	"io"
 	"log"
 	"math/rand"
+	"net"
 	"net/http"
 	"net/url"
 	"os"
@@ -32,21 +34,22 @@ import (
 
 var root = "/data"
 var retention = 10 * time.Minute
-var marker = "dat"
+var marker = "tig"
 var fileExtension = fmt.Sprintf(".%s", marker)
 var sslLocation = fmt.Sprintf("%s", marker)
 
 const MaxFileSize = 128 * 1024 * 1024
-const MaxMemSize = 8 * MaxFileSize
+const MaxMemSize = 4 * MaxFileSize
 
-// UDP multicast is limited on K8S. We can use a headless service instead.
-// We use linear polling because goroutines use too much memory. Favor scaling up over scaling out.
-// JetstreamDB relies on replicas for consistency, the backup chain
-// We can retrieve fresh items from the next level backups.
-// nodes holds groups of node identifiers or addresses.
+// Cluster endpoint
 var cluster = "http://localhost:7777"
+
+// Snapshot topology
 var nodes = [][]string{{"http://localhost:7777"}, {"https://hour.schmied.us"}}
-var rateLimiting sync.Mutex
+
+// Reliability measures
+var pinnedIP = map[string]string{"localhost": "127.0.0.1", "hour.schmied.us": "18.209.57.108"}
+var rateLimitIng sync.Mutex
 
 // Fairly unique instance ID to avoid routing loops. TODO uuidgen?
 var instance = fmt.Sprintf("%d", time.Now().UnixNano()+rand.Int63())
@@ -71,6 +74,42 @@ var client = &http.Client{
 	},
 }
 
+func NewRequestWithPinnedIP(urlStr, method string, body []byte) (*http.Request, *http.Client, error) {
+	u, err := url.Parse(urlStr)
+	if err != nil {
+		return nil, nil, err
+	}
+	host := u.Hostname()
+	ip, ok := pinnedIP[host]
+	if !ok {
+		return nil, nil, fmt.Errorf("no pinned IP for host: %s", host)
+	}
+	port := u.Port()
+	if port == "" {
+		if u.Scheme == "https" {
+			port = "443"
+		} else {
+			port = "80"
+		}
+	}
+	ipPort := ip + ":" + port
+	tr := &http.Transport{
+		TLSClientConfig: &tls.Config{ServerName: host},
+		DialContext: func(ctx context.Context, network, addr string) (net.Conn, error) {
+			var d net.Dialer
+			return d.DialContext(ctx, network, ipPort)
+		},
+	}
+	client := &http.Client{Transport: tr}
+	req, err := http.NewRequest(method, urlStr, bytes.NewReader(body))
+	if err != nil {
+		return nil, nil, err
+	}
+	// Set Host header for SNI
+	req.Host = host
+	return req, client, nil
+}
+
 func main() {
 	_, err := os.Stat(root)
 	if err != nil {
@@ -92,13 +131,22 @@ func main() {
 }
 
 func Setup() {
-	for i := 0; i < MaxMemSize/MaxFileSize/2; i++ {
+	for i := 0; i < MaxMemSize/MaxFileSize; i++ {
 		level1Pool <- make([]byte, MaxFileSize)
 	}
-	for i := 0; i < MaxMemSize/MaxFileSize/2; i++ {
-		level2Pool <- make([]byte, MaxFileSize)
+	// Allocate level2Pool only if any node group has more than one member (enables distributed routing)
+	needLevel2 := false
+	for _, grp := range nodes {
+		if len(grp) > 1 {
+			needLevel2 = true
+			break
+		}
 	}
-
+	if needLevel2 {
+		for i := 0; i < MaxMemSize/MaxFileSize; i++ {
+			level2Pool <- make([]byte, MaxFileSize)
+		}
+	}
 	go func() {
 		for {
 			now := time.Now()
@@ -330,10 +378,19 @@ func ReadStoreBuffer(w io.Writer, r *http.Request) int {
 	if r.URL.Query().Get("burst") == "1" {
 		scanner := bufio.NewScanner(bytes.NewBuffer(data))
 		for scanner.Scan() {
-			filePath = path.Join(root, scanner.Text())
-			data, err = os.ReadFile(filePath)
-			MarkAsUsed(r, filePath)
-			NoIssueWrite(w.Write(data))
+			line := scanner.Text()
+			if IsValidDatHash(line) && cluster != "" {
+				req, client, err := NewRequestWithPinnedIP(cluster+line, "GET", nil)
+				if err == nil {
+					resp, err := client.Do(req)
+					if err == nil && resp.StatusCode == http.StatusOK {
+						_, _ = io.Copy(w, resp.Body)
+					}
+					if resp != nil && resp.Body != nil {
+						_ = resp.Body.Close()
+					}
+				}
+			}
 		}
 	} else {
 		NoIssueWrite(w.Write(data))
@@ -530,7 +587,7 @@ func DistributedAddress(r *http.Request, bodyHash, clusterAddress string) (strin
 }
 
 func DistributedCheck(address string) bool {
-	req, err := http.NewRequest("HEAD", address, nil)
+	req, client, err := NewRequestWithPinnedIP(address, "HEAD", nil)
 	if err != nil {
 		return false
 	}
@@ -548,7 +605,7 @@ func DistributedCheck(address string) bool {
 }
 
 func DistributedCall(w http.ResponseWriter, r *http.Request, method string, body []byte, address string) bool {
-	req, err := http.NewRequest(method, address, bytes.NewBuffer(body))
+	req, client, err := NewRequestWithPinnedIP(address, method, body)
 	if err != nil {
 		return false
 	}
@@ -600,9 +657,9 @@ func QuantumGradeError() {
 	// Encryption: We still rely on your OS provided TLS library .
 	// This is still not optimal allowing attackers to use memory with the default http implementation.
 	// Paid pro versions may use UDP.
-	rateLimiting.Lock()
+	rateLimitIng.Lock()
 	time.Sleep(2 * time.Millisecond)
-	rateLimiting.Unlock()
+	rateLimitIng.Unlock()
 	time.Sleep(10 * time.Millisecond)
 }
 
@@ -644,11 +701,11 @@ func BackupToChain(backupChain string, r *http.Request, body []byte) {
 			q.Add(k, v)
 		}
 	}
-	// Increase depth for next hop replication using obfuscated depthCall key
 	q.Set(depthCall, fmt.Sprintf("%d", GetDepth(r)+1))
 	u.Path = r.URL.Path
 	u.RawQuery = q.Encode()
-	req, reqErr := http.NewRequest(r.Method, u.String(), bytes.NewReader(body))
+	urlStr := u.String()
+	req, client, reqErr := NewRequestWithPinnedIP(urlStr, r.Method, body)
 	if reqErr == nil {
 		for k, v := range r.Header {
 			if strings.ToLower(k) == "host" {
@@ -676,11 +733,11 @@ func DeleteToChain(backupChain string, r *http.Request) {
 			q.Add(k, v)
 		}
 	}
-	// Increase depth for next hop deletion propagation using obfuscated depthCall key
 	q.Set(depthCall, fmt.Sprintf("%d", GetDepth(r)+1))
 	u.Path = r.URL.Path
 	u.RawQuery = q.Encode()
-	req, reqErr := http.NewRequest("DELETE", u.String(), nil)
+	urlStr := u.String()
+	req, client, reqErr := NewRequestWithPinnedIP(urlStr, "DELETE", nil)
 	if reqErr == nil {
 		for k, v := range r.Header {
 			if strings.ToLower(k) == "host" {
@@ -718,9 +775,10 @@ func RestoreFromChain(restoreChain string, w http.ResponseWriter, r *http.Reques
 	q.Set(depthCall, fmt.Sprintf("%d", GetDepth(r)+1))
 	u.Path = r.URL.Path
 	u.RawQuery = q.Encode()
-	req, err := http.NewRequest("GET", u.String(), nil)
-	req.Header.Set(depthCall, fmt.Sprintf("%d", GetDepth(r)+1))
-	if err == nil {
+	urlStr := u.String()
+	req, client, reqErr := NewRequestWithPinnedIP(urlStr, "GET", nil)
+	if reqErr == nil {
+		req.Header.Set(depthCall, fmt.Sprintf("%d", GetDepth(r)+1))
 		for k, v := range r.Header {
 			if strings.ToLower(k) != "host" {
 				for _, vv := range v {
