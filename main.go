@@ -34,7 +34,7 @@ import (
 
 var root = "/data"
 var retention = 10 * time.Minute
-var marker = "tig"
+var marker = "dat"
 var fileExtension = fmt.Sprintf(".%s", marker)
 var sslLocation = fmt.Sprintf("%s", marker)
 
@@ -42,13 +42,13 @@ const MaxFileSize = 128 * 1024 * 1024
 const MaxMemSize = 4 * MaxFileSize
 
 // Cluster endpoint
-var cluster = "http://localhost:7777"
+var cluster = "http://127.0.0.1:7777"
 
 // Snapshot topology
-var nodes = [][]string{{"http://localhost:7777"}, {"https://hour.schmied.us"}}
+var nodes = [][]string{{"http://127.0.0.1:7777"}, {"https://18.209.57.108:443"}}
 
 // Reliability measures
-var pinnedIP = map[string]string{"localhost": "127.0.0.1", "hour.schmied.us": "18.209.57.108"}
+var pinnedIP = map[string]string{"127.0.0.1": "localhost", "18.209.57.108": "hour.schmied.us"}
 var rateLimitIng sync.Mutex
 
 // Fairly unique instance ID to avoid routing loops. TODO uuidgen?
@@ -79,10 +79,10 @@ func NewRequestWithPinnedIP(urlStr, method string, body []byte) (*http.Request, 
 	if err != nil {
 		return nil, nil, err
 	}
-	host := u.Hostname()
-	ip, ok := pinnedIP[host]
+	ip := u.Hostname()
+	host, ok := pinnedIP[ip]
 	if !ok {
-		return nil, nil, fmt.Errorf("no pinned IP for host: %s", host)
+		return nil, nil, fmt.Errorf("no pinned host for IP: %s", ip)
 	}
 	port := u.Port()
 	if port == "" {

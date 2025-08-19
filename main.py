@@ -12,20 +12,20 @@ class ThreadingHTTPServer(ThreadingMixIn, HTTPServer):
 # --- Config ---
 root = "/data"
 retention = 10 * 60  # 10 minutes in seconds
-marker = "tig"
+marker = "dat"
 fileExtension = f".{marker}"
 sslLocation = marker
 MaxFileSize = 128 * 1024 * 1024
 MaxMemSize = 4 * MaxFileSize
 
 # Cluster endpoint
-cluster = "http://localhost:7777"
+cluster = "http://127.0.0.1:7777"
 
 # Snapshot topology
-nodes = [["http://localhost:7777"], ["https://hour.schmied.us"]]
+nodes = [["http://127.0.0.1:7777"], ["https://18.209.57.108:443"]]
 
 # Reliability measures
-pinnedIP = {'localhost': '127.0.0.1', 'hour.schmied.us': '18.209.57.108'}
+pinnedIP = {'127.0.0.1': 'localhost', '18.209.57.108': 'hour.schmied.us'}
 
 # Fairly unique instance ID to avoid routing loops.
 instance = str(int(time.time() * 1e9) + random.randint(0, 1 << 30))
@@ -50,11 +50,11 @@ def request_with_pinned_ip(url, method='GET', data=None, headers=None, timeout=1
     Make an HTTP/HTTPS request to a URL using a pinned IP for the host, enforcing SNI and Host header.
     """
     parsed = urllib.parse.urlparse(url)
-    host = parsed.hostname
+    ip = parsed.hostname
     port = parsed.port or (443 if parsed.scheme == 'https' else 80)
-    ip = pinnedIP.get(host)
-    if not ip:
-        raise Exception(f"No pinned IP for host: {host}")
+    host = pinnedIP.get(ip)
+    if not host:
+        raise Exception(f"No pinned host for IP: {ip}")
     path = parsed.path or '/'
     if parsed.query:
         path += '?' + parsed.query
@@ -68,13 +68,16 @@ def request_with_pinned_ip(url, method='GET', data=None, headers=None, timeout=1
     conn = None
     try:
         if parsed.scheme == 'https':
+            # For HTTPS, we connect to the IP, but specify the hostname for TLS SNI
             sock = socket.create_connection((ip, port), timeout=timeout)
             context = ssl.create_default_context()
-            # SNI is enabled by default with server_hostname
             ssock = context.wrap_socket(sock, server_hostname=host)
-            conn = http.client.HTTPSConnection(host=host, port=port, timeout=timeout)
+            # We pass the original host to HTTPSConnection for it to use in headers,
+            # but the actual connection is already established to the IP.
+            conn = http.client.HTTPSConnection(host, port, timeout=timeout)
             conn.sock = ssock
         else:
+            # For HTTP, it's simpler, just connect to the IP. The Host header is set manually.
             conn = http.client.HTTPConnection(ip, port, timeout=timeout)
         
         conn.request(method, path, body=data, headers=req_headers)
@@ -198,10 +201,10 @@ def write_volatile(handler, body):
             return
         if data.startswith(WriteOnlySecret.encode()):
             secretHash = data[len(WriteOnlySecret):].decode()
-            if is_valid_root_hash_extension("/"+secretHash) and cluster:
-                url = cluster + "/" + secretHash + ("?" + up.query if up.query else "")
+            if is_valid_root_hash_extension(secretHash) and cluster:
+                url = cluster + secretHash + ("?" + up.query if up.query else "")
                 try:
-                    request_with_pinned_ip(url, method="POST", data=body)
+                    request_with_pinned_ip(url, method="PUT", data=body)
                     handler.wfile.write(up.path.encode())
                 except Exception:
                     pass
@@ -210,10 +213,10 @@ def write_volatile(handler, body):
             if handler.q.get("append", ["0"])[0] != "1":
                 return
             secretHash = data[len(AppendOnlySecret):].decode()
-            if is_valid_root_hash_extension("/"+secretHash) and cluster:
-                url = cluster + "/" + secretHash + ("?" + up.query if up.query else "")
+            if is_valid_root_hash_extension(secretHash) and cluster:
+                url = cluster + secretHash + ("?" + up.query if up.query else "")
                 try:
-                    request_with_pinned_ip(url, method="POST", data=body)
+                    request_with_pinned_ip(url, method="PUT", data=body)
                     handler.wfile.write(up.path.encode())
                 except Exception:
                     pass
@@ -273,19 +276,14 @@ def read_store(handler):
             handler.end_headers()
             return
         if data.startswith(ReadOnlySecret.encode()):
-            sh = data[len(ReadOnlySecret):].decode()
-            if is_valid_root_hash_extension("/"+sh) and cluster:
+            sh = data[len(ReadOnlySecret):].decode().strip()
+            if is_valid_root_hash_extension(sh) and cluster:
                 try:
-                    # The Go code uses a global client that skips verification.
-                    # We use a context that does the same for this specific case.
-                    insecure_ctx = ssl.create_default_context()
-                    insecure_ctx.check_hostname = False
-                    insecure_ctx.verify_mode = ssl.CERT_NONE
-                    with urllib.request.urlopen(cluster + "/" + sh, context=insecure_ctx) as resp:
-                        if resp.status == 200:
-                            data = resp.read()
-                        else:
-                            handler.send_response(403); handler.end_headers(); return
+                    resp = request_with_pinned_ip(cluster + sh, method='GET')
+                    if resp.status == 200:
+                        data = resp.read()
+                    else:
+                        handler.send_response(403); handler.end_headers(); return
                 except Exception:
                     handler.send_response(403); handler.end_headers(); return
 

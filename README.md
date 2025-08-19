@@ -755,6 +755,21 @@ Such an approach reduces the risks and costs of each vendor. This is useful for 
 
 It is a good idea that vendors use different distributions of Linux or Windows to harden the system.
 
+## Reliability
+
+There is a design choice of returning buffers only when they are gathered. This adds some latency and some low latency implementations requiring memory may suffer.
+
+Our opinion is that memory already increases some applications 60x. (Reference: Kove) Some latency can be solved by using smaller buffers and changing some application logic to use bursts.
+
+Reliability may suffer if we start streaming and propagate hardware errors to the client with truncated blocks.
+These systems are designed to run on massive datacenters with tens of thousands of components. If hardware errors are not propagated, their impact will not become quadratic or exponential by cluster size.
+
+This is the reason why we do not implement any retry logic either. Any retry logic may degrade the latency and performance by a magnitude.
+The jitter allowed by retry logic could be leveraged by malware to spare time to redirect the second calls of simulated errors.
+Such jittery retry logic may allow suffering some users from slow responses, while others get priority by malware and simulated errors.
+
+We rather propagate even sporadic errors to the users, so that they notice, raise their concern and get the issue resolved before it escalates. Our goal is zero percent packet loss.
+
 ## Consistency
 
 Jetstream Database uses an economic approach to consistency.
