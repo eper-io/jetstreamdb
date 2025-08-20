@@ -1,0 +1,11 @@
+{
+  "Version": 1,
+  "Hash": "flbtXNCdrr5IPscf+6G+xe+FFVEDbIwrUpFGJmQuDsM=",
+  "Source": "JetStreamDB",
+  "BasePath": "_content/JetStreamDB",
+  "Mode": "Default",
+  "ManifestType": "Build",
+  "ReferencedProjectsConfiguration": [],
+  "DiscoveryPatterns": [],
+  "Assets": []
+}
