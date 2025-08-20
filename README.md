@@ -825,6 +825,37 @@ It started as a git alternative for your codebase or data, but it grew in featur
 The logo was inspired by the tea clipper. They represented the pinnacle of sailing ship design, combining sleek hulls, tall masts, and enormous sail area to achieve remarkable speeds.
 The term "clipper" comes from the word "clip," meaning to move swiftly. These ships were designed to "clip" along at high speeds, regularly achieving 16-18 knots - extremely fast for sailing vessels of that era.
 
+## Logic
+
+The system must not replicate data across nodes at the same level to maintain consistency. Instead, it should act as a proxy, fetching the data from a peer on the fly if it doesn't have it locally. The search should be exhaustive at the current tier before moving to the next.
+
+1.  **Peer-First Strategy**: For `GET` requests, if a file is not found locally, the system now attempts to fetch it from a peer node at the same level. The data is streamed directly to the client on-the-fly without being stored locally, which prevents data consistency issues.
+
+2.  **Tiered Fallback**: If the file isn't available on any peer, the request is forwarded to the next tier of nodes as a fallback.
+
+3.  **Optimized Request Flow**: The logic inside `fulfillRequestLocally` and `fulfillRequestByCluster` has been refactored to ensure that local files are served immediately, and only non-local requests trigger the cluster-aware fetching logic.
+
+These changes ensure that data is served efficiently from the distributed network while strictly avoiding local caching of peer data to maintain consistency. The code has been updated.
+
+## ACID
+
+Our approach to ACID principles is pragmatic economics. We insist on features occurring less than 1% not to degrade the performance of features occurring more than 50%.
+
+Imagine a single processor ACID compliant relational database. Two transactions of the same slot will be racing for a period of few milliseconds. Whoever gets the slot is usually dependent of factors like the network. Which one is faster is random, and it has always been random. It is pointless to hold back other transactions with memory bus locks, etc. Our approach is similar deciding later when reading which transaction of the same key found the server with the higher ordinal. We suggest using the append logic to be ACID compliant instead of locks, enforcing the durability of each glitch and change log.
+
+1. ** Atomicity ** We read full blocks and avoid streaming. We reserve block space in pools, we perform rate limiting parallel requests by the memory available. We use atomic operating system primitives to read or write entire files. A final burst query can collect atomic data sets.
+2. ** Consistency ** We enforce a single point of storage for blocks segments that consistently belong together by the application. When two distant peer servers write to the same location, the nodes list ordinal consistently sets multiple but returns the same slot. We use append, take, and set-if-not primitives to implement FIFO, LIFO, stack, semaphore, snapshots, and time travel.
+3. ** Integrity ** We back up changes and fetch on demand on startup. Our fixed retention period always helps to decide and understand, where the data is, and why it is not there, if it was cleaned up. Retention is system wide. Applications can use health checks to keep segments alive like the CPU does with swapping.
+4. ** Durability ** We use a layered approach to backup and snapshot the data. The final layers can be SSD, or hard disk. The file format of a sha256 and an extension, and the limited segment & file size allows to write effective scripts at scale.
+
+## CAP
+
+Our approach to ACID principles is pragmatic economics. Users are welcome to scale up with RAM nodes to resolve any performance issues.
+
+1. ** Consistency ** We enforce a single point of storage for blocks segments that consistently belong together by the application. When two distant peer servers write to the same location, the nodes list ordinal consistently sets multiple but returns the same slot. We use append, take, and set-if-not primitives to implement FIFO, LIFO, stack, semaphore, snapshots, and time travel.
+2. ** Availability ** Our layered backup and snapshot approach allows superior reliability. The peer logic to find and fetch blocks makes it completely distributed. There is absolutely no single point of failure. Even the configuration is hard coded into the code with CI/CD scripts making it resilient on DNS errors.
+3. ** Partition Tolerance ** Our distributed check and fetch logic is a demonstration of partition tolerance. Two distant changes will return a consistent copy of the higher ordinal server. The first layer is designed to be in RAM making queries lightning fast backing up immediately. Each and every node is independent storing a random chunk of the data. Applications can set their level of reliability by sending more replicas choosing the IPs desired randomly. We also allow multiple snapshot layers that allow immediate startup. The retention period allows that only data that is really needed is fetched making it one of the fastest cold start databases. Eventual reconciliation is enforced by hard coded priorities of short period data changes using peer node ordinals. Long term changes are secured by the fetch all nodes logic without indexes. This is possible due to the fixed retention period in the system. Once it expires, there is only one copy of each data key per layer. 
+
 ## TODO
 
 - Jetstream was actually a quick idea. It is not really a `git` clone anymore. We could rename this to `storage` or even better `router` that reflects the behavior. It is a timed router or RAM cache.

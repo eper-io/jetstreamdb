@@ -55,9 +55,10 @@ def request_with_pinned_ip(url, method='GET', data=None, headers=None, timeout=1
     host = pinnedIP.get(ip)
     if not host:
         raise Exception(f"No pinned host for IP: {ip}")
-    path = parsed.path or '/'
-    if parsed.query:
-        path += '?' + parsed.query
+    
+    # Reconstruct the path and query to ensure nothing is lost.
+    path = urllib.parse.urlunparse(('', '', parsed.path, '', parsed.query, ''))
+
     req_headers = headers.copy() if headers else {}
     req_headers['Host'] = host
     if method in ('POST', 'PUT') and data is not None:
@@ -489,7 +490,7 @@ class JetHandler(BaseHTTPRequestHandler):
 
         depth = get_depth(self)
         next_depth = depth + 1
-        if next_depth < len(nodes) and nodes[next_depth] and time.time() < (startupTime + retention):
+        if next_depth < len(nodes) and nodes[next_depth] and time.time() < (startupTime + retention) and not is_call_routed(self):
             if self.command in ["HEAD", "GET"] and is_valid_root_hash_extension(self.path):
                 p = os.path.join(root, self.path[1:])
                 if not os.path.exists(p):

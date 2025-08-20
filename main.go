@@ -101,7 +101,7 @@ func NewRequestWithPinnedIP(urlStr, method string, body []byte) (*http.Request, 
 		},
 	}
 	client := &http.Client{Transport: tr}
-	req, err := http.NewRequest(method, urlStr, bytes.NewReader(body))
+	req, err := http.NewRequest(method, u.String(), bytes.NewReader(body))
 	if err != nil {
 		return nil, nil, err
 	}
@@ -177,10 +177,7 @@ func Setup() {
 		depth := GetDepth(r)
 		// Use nodes fan-out when more than one node in the selected depth group instead of cluster check
 		if len(nodes) > 0 && depth < len(nodes) && len(nodes[depth]) > 1 && !IsCallRouted(w, r) {
-			if fulfillRequestByCluster(w, r) {
-				return
-			}
-			fmt.Println("unexpected error")
+			fulfillRequestByCluster(w, r)
 			return
 		}
 		buffer := <-level1Pool
@@ -249,7 +246,7 @@ func fulfillRequestLocally(w http.ResponseWriter, r *http.Request, body []byte) 
 	// Dynamic restore: depth n uses random node from nodes[n+1] if exists during warmup window
 	depth := GetDepth(r)
 	next := depth + 1
-	if next < len(nodes) && len(nodes[next]) > 0 && time.Now().Before(startupTime.Add(retention)) {
+	if next < len(nodes) && len(nodes[next]) > 0 && time.Now().Before(startupTime.Add(retention)) && !IsCallRouted(w, r) {
 		if (r.Method == "HEAD" || r.Method == "GET") && IsValidDatHash(r.URL.Path) {
 			_, err := os.Stat(path.Join(root, r.URL.Path))
 			if err != nil {
@@ -291,7 +288,7 @@ func fulfillRequestLocally(w http.ResponseWriter, r *http.Request, body []byte) 
 	}
 }
 
-func fulfillRequestByCluster(w http.ResponseWriter, r *http.Request) bool {
+func fulfillRequestByCluster(w http.ResponseWriter, r *http.Request) {
 	buffer := <-level2Pool
 	defer func(a0 []byte) {
 		for i := range a0 {
@@ -324,10 +321,10 @@ func fulfillRequestByCluster(w http.ResponseWriter, r *http.Request) bool {
 	}
 	if remoteAddress != "" {
 		DistributedCall(w, r, r.Method, body, remoteAddress)
-		return true
+		return
 	}
 	fulfillRequestLocally(w, r, body)
-	return true
+	return
 }
 
 func ReadStore(w http.ResponseWriter, r *http.Request) {
