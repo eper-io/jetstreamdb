@@ -1,0 +1,23 @@
+# C# Build artifacts
+bin/
+obj/
+*.dll
+*.pdb
+*.cache
+*.nuget.dgspec.json
+*.nuget.g.props
+*.nuget.g.targets
+project.assets.json
+project.nuget.cache
+
+# IDE files
+.vs/
+.vscode/
+*.suo
+*.user
+*.userprefs
+*.sln.DotSettings
+
+# OS files
+.DS_Store
+Thumbs.db
