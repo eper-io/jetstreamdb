@@ -108,11 +108,10 @@ namespace JetStreamDB
             var app = builder.Build();
 
             // Configure the HTTP request pipeline
-            app.Use(async (context, next) =>
+            app.Run(async (HttpContext context) =>
             {
                 var jetStreamService = context.RequestServices.GetRequiredService<JetStreamService>();
                 await jetStreamService.HandleRequest(context);
-                await next();
             });
 
             // Configure SSL/TLS
@@ -196,12 +195,15 @@ namespace JetStreamDB
                 try
                 {
                     byte[] body = null;
-                    if (request.Body != null && request.ContentLength > 0)
+                    if (request.Body != null && request.Body.CanRead)
                     {
-                        using var memoryStream = new MemoryStream(buffer);
-                        var maxRead = Math.Min((int)request.ContentLength.Value, MaxFileSize);
+                        using var memoryStream = new MemoryStream();
                         await request.Body.CopyToAsync(memoryStream);
-                        body = memoryStream.ToArray()[..maxRead];
+                        body = memoryStream.ToArray();
+                        if (body.Length > MaxFileSize)
+                        {
+                            Array.Resize(ref body, MaxFileSize);
+                        }
                     }
 
                     await FulfillRequestLocally(context, body);
@@ -352,12 +354,15 @@ namespace JetStreamDB
                 try
                 {
                     byte[] body = null;
-                    if (context.Request.Body != null && context.Request.ContentLength > 0)
+                    if (context.Request.Body != null && context.Request.Body.CanRead)
                     {
-                        using var memoryStream = new MemoryStream(buffer);
-                        var maxRead = Math.Min((int)context.Request.ContentLength.Value, MaxFileSize);
+                        using var memoryStream = new MemoryStream();
                         await context.Request.Body.CopyToAsync(memoryStream);
-                        body = memoryStream.ToArray()[..maxRead];
+                        body = memoryStream.ToArray();
+                        if (body.Length > MaxFileSize)
+                        {
+                            Array.Resize(ref body, MaxFileSize);
+                        }
                     }
 
                     var bodyHash = $"{ToHexString(ComputeSha256(body ?? Array.Empty<byte>()))}{_fileExtension}";
