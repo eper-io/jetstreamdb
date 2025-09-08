@@ -839,7 +839,7 @@ These changes ensure that data is served efficiently from the distributed networ
 
 ## ACID
 
-Our approach to ACID principles is pragmatic economics. We insist on features occurring less than 1% not to degrade the performance of features occurring more than 50%.
+Our approach to ACID principles is pragmatic economics. We insist on features occurring less than 1% not to degrade the performance of features occurring more than 50%. Our implementation requires that data keys need to be created in advance to satisfy ACID requirements.
 
 Imagine a single processor ACID compliant relational database. Two transactions of the same slot will be racing for a period of few milliseconds. Whoever gets the slot is usually dependent of factors like the network. Which one is faster is random, and it has always been random. It is pointless to hold back other transactions with memory bus locks, etc. Our approach is similar deciding later when reading which transaction of the same key found the server with the higher ordinal. We suggest using the append logic to be ACID compliant instead of locks, enforcing the durability of each glitch and change log.
 

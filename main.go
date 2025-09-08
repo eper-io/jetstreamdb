@@ -100,7 +100,7 @@ func NewRequestWithPinnedIP(urlStr, method string, body []byte) (*http.Request, 
 			return d.DialContext(ctx, network, ipPort)
 		},
 	}
-	client := &http.Client{Transport: tr}
+	client := &http.Client{Transport: tr, Timeout: 10 * time.Second}
 	req, err := http.NewRequest(method, u.String(), bytes.NewReader(body))
 	if err != nil {
 		return nil, nil, err

@@ -1,0 +1,8 @@
+.idea/
+documentation/ca_bundle.crt
+documentation/certificate.crt
+documentation/private.key
+documentation/tig.log
+implementation/
+.git/
+.DS_Store

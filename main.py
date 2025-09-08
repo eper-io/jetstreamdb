@@ -67,24 +67,21 @@ def request_with_pinned_ip(url, method='GET', data=None, headers=None, timeout=1
         data = None
     
     conn = None
+    start = time.time()
     try:
         if parsed.scheme == 'https':
-            # For HTTPS, we connect to the IP, but specify the hostname for TLS SNI
             sock = socket.create_connection((ip, port), timeout=timeout)
             context = ssl.create_default_context()
             ssock = context.wrap_socket(sock, server_hostname=host)
-            # We pass the original host to HTTPSConnection for it to use in headers,
-            # but the actual connection is already established to the IP.
             conn = http.client.HTTPSConnection(host, port, timeout=timeout)
             conn.sock = ssock
         else:
-            # For HTTP, it's simpler, just connect to the IP. The Host header is set manually.
             conn = http.client.HTTPConnection(ip, port, timeout=timeout)
-        
         conn.request(method, path, body=data, headers=req_headers)
+        # Enforce total round-trip timeout manually in case of slow reads
+        conn.sock.settimeout(timeout - (time.time() - start))
         resp = conn.getresponse()
         resp_body = resp.read()
-        
         class Resp:
             def __init__(self, status, body, headers):
                 self.status = status
@@ -92,11 +89,13 @@ def request_with_pinned_ip(url, method='GET', data=None, headers=None, timeout=1
                 self.headers = headers
             def read(self):
                 return self._body
-        
         return Resp(resp.status, resp_body, dict(resp.getheaders()))
     finally:
         if conn:
-            conn.close()
+            try:
+                conn.close()
+            except Exception:
+                pass
 
 # --- Helpers ---
 sha256 = lambda b: hashlib.sha256(b).hexdigest()
