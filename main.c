@@ -303,10 +303,15 @@ void jetstream_server(void) {
     SSL_CTX* ssl_ctx = NULL;
     int use_tls = 0;
     int port;
+
+    // Ensure /data directory exists
+    if (mkdir(DATA, 0755) < 0 && errno != EEXIST) {
+        perror("Failed to create /data directory");
+        return;
+    }
     
-    // Check for TLS certificates
-    if (access("/etc/ssl/jetstream.key", F_OK) == 0 && 
-        access("/etc/ssl/jetstream.crt", F_OK) == 0) {
+    // Check for TLS certificates (match main.go logic)
+    if (access("/etc/ssl/jetstream.key", F_OK) == 0) {
         use_tls = 1;
         port = 443;
         
@@ -321,9 +326,26 @@ void jetstream_server(void) {
             return;
         }
         
-        if (SSL_CTX_use_certificate_file(ssl_ctx, "/etc/ssl/jetstream.crt", SSL_FILETYPE_PEM) <= 0 ||
-            SSL_CTX_use_PrivateKey_file(ssl_ctx, "/etc/ssl/jetstream.key", SSL_FILETYPE_PEM) <= 0) {
-            fprintf(stderr, "Failed to load SSL certificates\n");
+        // Set SSL options for better compatibility
+        SSL_CTX_set_options(ssl_ctx, SSL_OP_NO_SSLv2 | SSL_OP_NO_SSLv3);
+        SSL_CTX_set_mode(ssl_ctx, SSL_MODE_AUTO_RETRY);
+        
+        // Load certificate chain (this handles intermediate certificates)
+        if (SSL_CTX_use_certificate_chain_file(ssl_ctx, "/etc/ssl/jetstream.crt") <= 0) {
+            fprintf(stderr, "Failed to load SSL certificate chain\n");
+            SSL_CTX_free(ssl_ctx);
+            return;
+        }
+        
+        if (SSL_CTX_use_PrivateKey_file(ssl_ctx, "/etc/ssl/jetstream.key", SSL_FILETYPE_PEM) <= 0) {
+            fprintf(stderr, "Failed to load SSL private key\n");
+            SSL_CTX_free(ssl_ctx);
+            return;
+        }
+        
+        // Verify that the private key matches the certificate
+        if (!SSL_CTX_check_private_key(ssl_ctx)) {
+            fprintf(stderr, "Private key does not match certificate\n");
             SSL_CTX_free(ssl_ctx);
             return;
         }
@@ -637,6 +659,9 @@ void jetstream_volatile(const char* path, const char** query_strings, const char
         if (fd >= 0) {
             ssize_t bytes_written = 0;
             if (input_buffer && input_size > 0) {
+                if (input_size > MAX_FILE_SIZE) {
+                    input_size = MAX_FILE_SIZE;
+                }
                 bytes_written = write(fd, input_buffer, input_size);
             }
             close(fd);
@@ -1174,6 +1199,16 @@ void jetstream_application(const char* path, const char** query_strings, const c
 
 int main() {
     printf("Starting Jetstream server...\n");
+    
+    // Ensure data directory exists
+    struct stat st;
+    if (stat(DATA, &st) != 0) {
+        if (mkdir(DATA, 0755) != 0 && errno != EEXIST) {
+            perror("Failed to create data directory");
+        }
+    } else if (!S_ISDIR(st.st_mode)) {
+        fprintf(stderr, "DATA path is not a directory: %s\n", DATA);
+    }
     
     // Start watchdog thread
     pthread_t watchdog_tid;

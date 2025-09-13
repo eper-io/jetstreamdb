@@ -1,605 +1,875 @@
-import os, time, random, hashlib, threading, urllib.request, urllib.parse, ssl
-from http.server import HTTPServer, BaseHTTPRequestHandler
-from socketserver import ThreadingMixIn
+#!/usr/bin/env python3
+"""
+JetStream Database Server
+A high-performance database server with HTTP API interface
+"""
+
+import os
+import ssl
 import socket
-import queue
-import http.client
+import threading
+from http.server import HTTPServer, BaseHTTPRequestHandler
+from urllib.parse import urlparse, parse_qs
+from typing import List, Dict, Optional, Tuple, Any
+import json
+import hashlib
+import re
+import time
 
-class ThreadingHTTPServer(ThreadingMixIn, HTTPServer):
-    """Handle requests in a separate thread."""
-    daemon_threads = True
+DATA = "/data"
+# File and cleanup constants
+MAX_FILE_SIZE = 1_048_576  # 1 MiB limit (not strictly enforced in all paths yet)
+WATCHDOG_TTL_SECONDS = 60  # Files older than this will be deleted by watchdog
 
-# --- Config ---
-root = "/data"
-retention = 10 * 60  # 10 minutes in seconds
-marker = "dat"
-fileExtension = f".{marker}"
-sslLocation = marker
-MaxFileSize = 128 * 1024 * 1024
-MaxMemSize = 4 * MaxFileSize
 
-# Cluster endpoint
-cluster = "http://127.0.0.1:7777"
+# Function Prototypes
+def jetstream_volatile(path: str, query_strings: List[str], method: str, 
+                      http_params: List[str], input_buffer: bytes, 
+                      input_size: int, output_buffer: bytearray, 
+                      output_size: int) -> None:
+    """Handle volatile storage operations"""
+    pass
 
-# Snapshot topology
-nodes = [["http://127.0.0.1:7777"], ["https://18.209.57.108:443"]]
 
-# Reliability measures
-pinnedIP = {'127.0.0.1': 'localhost', '18.209.57.108': 'hour.schmied.us'}
+def jetstream_nonvolatile(path: str, query_strings: List[str], method: str,
+                         http_params: List[str], input_buffer: bytes,
+                         input_size: int, output_buffer: bytearray,
+                         output_size: int) -> None:
+    """Handle non-volatile storage operations"""
+    pass
 
-# Fairly unique instance ID to avoid routing loops.
-instance = str(int(time.time() * 1e9) + random.randint(0, 1 << 30))
 
-routedCall = "09E3F5F0-1D87-4B54-B57D-8D046D001942"
-depthCall = "9D2D182E-0F2D-42D8-911B-071443F8D21C"
+def jetstream_local(path: str, query_strings: List[str], method: str,
+                   http_params: List[str], input_buffer: bytes,
+                   input_size: int, output_buffer: bytearray,
+                   output_size: int) -> None:
+    """Handle local storage operations"""
+    pass
 
-# Pools avoid deadlocks and bottlenecks due to memory allocation.
-pool_size = MaxMemSize // MaxFileSize if MaxFileSize > 0 else 0
-level1Pool = queue.Queue(maxsize=pool_size)
-level2Pool = queue.Queue(maxsize=pool_size)
 
-# The startup time is used to determine if the system is still warming up.
-startupTime = time.time()
+def jetstream_restore(path: str, query_strings: List[str], method: str,
+                     http_params: List[str], input_buffer: bytes,
+                     input_size: int, output_buffer: bytearray,
+                     output_size: int) -> None:
+    """Handle restore operations"""
+    pass
 
-AppendOnlySecret = "Append only channel to segment "
-WriteOnlySecret = "Write only channel to segment "
-ReadOnlySecret = "Read only channel to segment "
 
-def request_with_pinned_ip(url, method='GET', data=None, headers=None, timeout=10):
-    """
-    Make an HTTP/HTTPS request to a URL using a pinned IP for the host, enforcing SNI and Host header.
-    """
-    parsed = urllib.parse.urlparse(url)
-    ip = parsed.hostname
-    port = parsed.port or (443 if parsed.scheme == 'https' else 80)
-    host = pinnedIP.get(ip)
-    if not host:
-        raise Exception(f"No pinned host for IP: {ip}")
-    
-    # Reconstruct the path and query to ensure nothing is lost.
-    path = urllib.parse.urlunparse(('', '', parsed.path, '', parsed.query, ''))
+def jetstream_remote(path: str, query_strings: List[str], method: str,
+                    http_params: List[str], input_buffer: bytes,
+                    input_size: int, output_buffer: bytearray,
+                    output_size: int) -> None:
+    """Handle remote operations - passes through to restore, local, nonvolatile, volatile"""
+    pass
 
-    req_headers = headers.copy() if headers else {}
-    req_headers['Host'] = host
-    if method in ('POST', 'PUT') and data is not None:
-        req_headers['Content-Length'] = str(len(data))
-    else:
-        data = None
-    
-    conn = None
-    start = time.time()
+
+def jetstream_application(path: str, query_strings: List[str], method: str,
+                         http_params: List[str], input_buffer: bytes,
+                         input_size: int, output_buffer: bytearray,
+                         output_size: int) -> None:
+    """Application layer - passes through to jetstream_remote"""
+    pass
+
+
+def jetstream_server() -> None:
+    """Main server function that handles TLS/HTTP connections"""
+    pass
+
+
+# Implementation of JetStream functions
+def jetstream_volatile(path: str, query_strings: List[str], method: str, 
+                      http_params: List[str], input_buffer: bytes, 
+                      input_size: int, output_buffer: bytearray, 
+                      output_size: int) -> None:
+    """Handle volatile storage operations"""
     try:
-        if parsed.scheme == 'https':
-            sock = socket.create_connection((ip, port), timeout=timeout)
-            context = ssl.create_default_context()
-            ssock = context.wrap_socket(sock, server_hostname=host)
-            conn = http.client.HTTPSConnection(host, port, timeout=timeout)
-            conn.sock = ssock
-        else:
-            conn = http.client.HTTPConnection(ip, port, timeout=timeout)
-        conn.request(method, path, body=data, headers=req_headers)
-        # Enforce total round-trip timeout manually in case of slow reads
-        conn.sock.settimeout(timeout - (time.time() - start))
-        resp = conn.getresponse()
-        resp_body = resp.read()
-        class Resp:
-            def __init__(self, status, body, headers):
-                self.status = status
-                self._body = body
-                self.headers = headers
-            def read(self):
-                return self._body
-        return Resp(resp.status, resp_body, dict(resp.getheaders()))
-    finally:
-        if conn:
+        # Helpers
+        def validate_sha_path(p: str) -> Optional[str]:
+            m = re.fullmatch(r"/([0-9a-fA-F]{64})\.dat", p or "")
+            return m.group(1).lower() if m else None
+
+        def full_path_from_rel(rel_path: str) -> str:
+            # Ensure we never escape DATA
+            rel = rel_path.lstrip("/\\")
+            return os.path.join(DATA, rel)
+
+        def get_format_template(qs: List[str]) -> Optional[str]:
+            for item in qs or []:
+                if "=" in item:
+                    k, v = item.split("=", 1)
+                else:
+                    k, v = item, ""
+                if k == "format":
+                    return v
+            return None
+
+        def apply_format(path_value: str, fmt: Optional[str]) -> bytes:
+            if not fmt:
+                return path_value.encode("ascii", errors="ignore")
+            # Replace placeholders with the path
+            formatted = fmt.replace("%25s", path_value).replace("%s", path_value).replace("*", path_value)
+            return formatted.encode("utf-8", errors="ignore")
+
+        def read_small(path: str, limit: int = 256) -> Optional[bytes]:
             try:
-                conn.close()
+                with open(path, "rb") as f:
+                    return f.read(limit)
+            except FileNotFoundError:
+                return None
+            except Exception:
+                return None
+
+        def parse_write_channel(buf: bytes) -> Optional[str]:
+            try:
+                txt = (buf or b"").decode('utf-8', errors='ignore').strip()
+            except Exception:
+                return None
+            m = re.fullmatch(r"Write channel\s+(/([0-9a-fA-F]{64})\.dat)", txt)
+            return m.group(1) if m else None
+
+        def parse_read_channel(buf: bytes) -> Optional[str]:
+            try:
+                txt = (buf or b"").decode('utf-8', errors='ignore').strip()
+            except Exception:
+                return None
+            m = re.fullmatch(r"Read channel\s+(/([0-9a-fA-F]{64})\.dat)", txt)
+            return m.group(1) if m else None
+
+        def parse_append_channel(buf: bytes) -> Optional[str]:
+            try:
+                txt = (buf or b"").decode('utf-8', errors='ignore').strip()
+            except Exception:
+                return None
+            m = re.fullmatch(r"Append channel\s+(/([0-9a-fA-F]{64})\.dat)", txt)
+            return m.group(1) if m else None
+
+        method_upper = (method or "").upper()
+        incoming_hash = validate_sha_path(path or "")
+        if not incoming_hash:
+            # Only allow /sha256.dat format
+            return
+
+        target_rel = f"/{incoming_hash}.dat"
+        target_full = full_path_from_rel(target_rel)
+
+        if method_upper in ("PUT", "POST", "PUSH"):
+            # Check for append=1 behavior
+            append_flag = False
+            for item in query_strings or []:
+                if "=" in item:
+                    k, v = item.split("=", 1)
+                else:
+                    k, v = item, ""
+                if k == "append" and v == "1":
+                    append_flag = True
+                    break
+
+            # If target file is an existing write channel, do not write; return marker
+            existing_bytes = read_small(target_full)
+            # Block writes to existing write/read channels
+            existing_write_target = parse_write_channel(existing_bytes) if existing_bytes is not None else None
+            existing_read_target = parse_read_channel(existing_bytes) if existing_bytes is not None else None
+            existing_append_target = parse_append_channel(existing_bytes) if existing_bytes is not None else None
+            if existing_write_target:
+                # Return the channel content for redirection
+                marker = existing_bytes.decode('utf-8', errors='ignore').strip()
+                marker_bytes = marker.encode('utf-8')
+                n = min(len(marker_bytes), output_size)
+                output_buffer[:n] = marker_bytes[:n]
+                return
+            if existing_append_target:
+                # Return the channel content for redirection
+                marker = existing_bytes.decode('utf-8', errors='ignore').strip()
+                marker_bytes = marker.encode('utf-8')
+                n = min(len(marker_bytes), output_size)
+                output_buffer[:n] = marker_bytes[:n]
+                return
+            if existing_read_target:
+                # Do not allow writing into read channel
+                return
+
+            # If the incoming buffer is a write-channel declaration, store it and return the request path
+            incoming_channel_target = parse_write_channel(input_buffer or b"")
+            if incoming_channel_target and not append_flag:
+                os.makedirs(DATA, exist_ok=True)
+                # Store the declaration (capped size)
+                to_write = (input_buffer or b"")[:MAX_FILE_SIZE]
+                with open(target_full, "wb") as f:
+                    if to_write:
+                        f.write(to_write)
+                try:
+                    os.utime(target_full, None)
+                except Exception:
+                    pass
+                # Return the channel file path
+                fmt = get_format_template(query_strings)
+                result_bytes = apply_format(target_rel, fmt)
+                n = min(len(result_bytes), output_size)
+                output_buffer[:n] = result_bytes[:n]
+                return
+
+            # If incoming buffer declares a read channel, store it and return the request path
+            incoming_read_target = parse_read_channel(input_buffer or b"")
+            if incoming_read_target and not append_flag:
+                os.makedirs(DATA, exist_ok=True)
+                to_write = (input_buffer or b"")[:MAX_FILE_SIZE]
+                with open(target_full, "wb") as f:
+                    if to_write:
+                        f.write(to_write)
+                try:
+                    os.utime(target_full, None)
+                except Exception:
+                    pass
+                # Return the channel file path
+                fmt = get_format_template(query_strings)
+                result_bytes = apply_format(target_rel, fmt)
+                n = min(len(result_bytes), output_size)
+                output_buffer[:n] = result_bytes[:n]
+                return
+
+            # If incoming buffer declares an append channel, store it and return the request path
+            incoming_append_target = parse_append_channel(input_buffer or b"")
+            if incoming_append_target and not append_flag:
+                os.makedirs(DATA, exist_ok=True)
+                to_write = (input_buffer or b"")[:MAX_FILE_SIZE]
+                with open(target_full, "wb") as f:
+                    if to_write:
+                        f.write(to_write)
+                try:
+                    os.utime(target_full, None)
+                except Exception:
+                    pass
+                # Return the channel file path
+                fmt = get_format_template(query_strings)
+                result_bytes = apply_format(target_rel, fmt)
+                n = min(len(result_bytes), output_size)
+                output_buffer[:n] = result_bytes[:n]
+                return
+
+            # Create or truncate and write (normal behavior)
+            os.makedirs(DATA, exist_ok=True)
+            if append_flag:
+                existed = os.path.exists(target_full)
+                # Determine how much we can append without exceeding MAX_FILE_SIZE
+                current_size = 0
+                if existed:
+                    try:
+                        current_size = os.path.getsize(target_full)
+                    except OSError:
+                        current_size = 0
+                remaining_cap = max(0, MAX_FILE_SIZE - current_size)
+                to_write = (input_buffer or b"")[:remaining_cap]
+                with open(target_full, "ab") as f:
+                    if to_write:
+                        f.write(to_write)
+                # Touch file to refresh mtime after write
+                try:
+                    os.utime(target_full, None)
+                except Exception:
+                    pass
+                # Return the request path (optionally formatted)
+                fmt = get_format_template(query_strings)
+                result_bytes = apply_format(target_rel, fmt)
+                n = min(len(result_bytes), output_size)
+                output_buffer[:n] = result_bytes[:n]
+            else:
+                # Overwrite with capped size
+                to_write = (input_buffer or b"")[:MAX_FILE_SIZE]
+                with open(target_full, "wb") as f:
+                    if to_write:
+                        f.write(to_write)
+                # Touch after write
+                try:
+                    os.utime(target_full, None)
+                except Exception:
+                    pass
+                # Return the request path (relative /sha256.dat), optionally formatted
+                fmt = get_format_template(query_strings)
+                result_bytes = apply_format(target_rel, fmt)
+                n = min(len(result_bytes), output_size)
+                output_buffer[:n] = result_bytes[:n]
+            return
+
+        elif method_upper in ("GET", "HEAD"):
+            # Check for take=1 which reads and then deletes the file
+            take_flag = False
+            for item in query_strings or []:
+                if "=" in item:
+                    k, v = item.split("=", 1)
+                else:
+                    k, v = item, ""
+                if k == "take" and v == "1":
+                    take_flag = True
+                    break
+            try:
+                with open(target_full, "rb") as f:
+                    data = f.read(output_size)
+                # If this file is a write channel, return empty string on GET/HEAD
+                channel_target = parse_write_channel(data)
+                if channel_target:
+                    return
+                # If this file is a read channel, return the marker for application to redirect
+                read_target = parse_read_channel(data)
+                if read_target:
+                    marker = f"Read channel {read_target}".encode('utf-8')
+                    n = min(len(marker), output_size)
+                    output_buffer[:n] = marker[:n]
+                    return
+                # Touch after read
+                try:
+                    os.utime(target_full, None)
+                except Exception:
+                    pass
+                if take_flag:
+                    # Attempt to delete after read
+                    try:
+                        os.remove(target_full)
+                    except FileNotFoundError:
+                        pass
+                output_buffer[:len(data)] = data
+            except FileNotFoundError:
+                # Return empty if not exists
+                return
+            return
+
+        elif method_upper == "DELETE":
+            # Prevent deletion of write/read/append channel files
+            existing_bytes = read_small(target_full)
+            existing_write_target = parse_write_channel(existing_bytes) if existing_bytes is not None else None
+            existing_read_target = parse_read_channel(existing_bytes) if existing_bytes is not None else None
+            existing_append_target = parse_append_channel(existing_bytes) if existing_bytes is not None else None
+            if existing_write_target or existing_read_target or existing_append_target:
+                return
+            try:
+                os.remove(target_full)
+                # Return the request path (optionally formatted)
+                fmt = get_format_template(query_strings)
+                result_bytes = apply_format(target_rel, fmt)
+                n = min(len(result_bytes), output_size)
+                output_buffer[:n] = result_bytes[:n]
+            except FileNotFoundError:
+                # Return empty string if did not exist
+                return
+            return
+
+        else:
+            # Unsupported -> empty
+            return
+    except Exception:
+        # Any error -> empty
+        return
+
+
+def jetstream_nonvolatile(path: str, query_strings: List[str], method: str,
+                         http_params: List[str], input_buffer: bytes,
+                         input_size: int, output_buffer: bytearray,
+                         output_size: int) -> None:
+    """Handle non-volatile storage operations"""
+    try:
+        # Helpers
+        def validate_sha_path(p: str) -> Optional[str]:
+            m = re.fullmatch(r"/([0-9a-fA-F]{64})\.dat", p or "")
+            return m.group(1).lower() if m else None
+
+        def full_path_from_rel(rel_path: str) -> str:
+            # Ensure we never escape DATA
+            rel = rel_path.lstrip("/\\")
+            return os.path.join(DATA, rel)
+
+        method_upper = (method or "").upper()
+
+        # Forward GET/HEAD requests unchanged
+        if method_upper in ("GET", "HEAD"):
+            jetstream_volatile(path, query_strings, method, http_params,
+                               input_buffer, input_size, output_buffer, output_size)
+            return
+
+        # PUT/POST filtering logic
+        if method_upper in ("PUT", "POST"):
+            content_hash = hashlib.sha256(input_buffer or b"").hexdigest()
+
+            # If path empty or root -> store under content hash path
+            if not path or path == "/":
+                new_path = f"/{content_hash}.dat"
+                jetstream_volatile(new_path, query_strings, method, http_params,
+                                   input_buffer, input_size, output_buffer, output_size)
+                return
+
+            incoming_hash = validate_sha_path(path)
+            if not incoming_hash:
+                # Invalid path format for key -> do nothing (safer than forcing a write)
+                return
+
+            if incoming_hash == content_hash:
+                # Path matches content hash -> write via volatile to that path
+                jetstream_volatile(path, query_strings, method, http_params,
+                                   input_buffer, input_size, output_buffer, output_size)
+                return
+
+            # Mismatch: inspect existing stored content at key path
+            target_full = full_path_from_rel(path)
+            try:
+                with open(target_full, "rb") as f:
+                    existing = f.read(1024 * 1024 + 1)  # read up to 1MB+1; size limits handled elsewhere
+                # Touch mtime after read
+                try:
+                    os.utime(target_full, None)
+                except Exception:
+                    pass
+                stored_hash = hashlib.sha256(existing).hexdigest()
+                if stored_hash == incoming_hash:
+                    # Key points to immutable content already; ignore put
+                    return
+                else:
+                    # Key is mutable KV: write new value under the key path
+                    jetstream_volatile(path, query_strings, method, http_params,
+                                       input_buffer, input_size, output_buffer, output_size)
+                    return
+            except FileNotFoundError:
+                # No existing value for key: treat as KV store write
+                jetstream_volatile(path, query_strings, method, http_params,
+                                   input_buffer, input_size, output_buffer, output_size)
+                return
+
+        # DELETE filtering logic
+        if method_upper == "DELETE":
+            incoming_hash = validate_sha_path(path or "")
+            if not incoming_hash:
+                return
+            target_full = full_path_from_rel(path)
+            try:
+                with open(target_full, "rb") as f:
+                    existing = f.read(1024 * 1024 + 1)
+                # Touch mtime after read
+                try:
+                    os.utime(target_full, None)
+                except Exception:
+                    pass
+                stored_hash = hashlib.sha256(existing).hexdigest()
+                if stored_hash == incoming_hash:
+                    # Immutable content: ignore delete
+                    return
+                else:
+                    # Mutable KV: allow delete via volatile
+                    jetstream_volatile(path, query_strings, method, http_params,
+                                       input_buffer, input_size, output_buffer, output_size)
+                    return
+            except FileNotFoundError:
+                # Nothing to delete; forward to volatile to maintain semantics (returns empty)
+                jetstream_volatile(path, query_strings, method, http_params,
+                                   input_buffer, input_size, output_buffer, output_size)
+                return
+
+        # Other methods -> empty
+        return
+    except Exception:
+        # On any error, return empty
+        return
+
+
+def jetstream_local(path: str, query_strings: List[str], method: str,
+                   http_params: List[str], input_buffer: bytes,
+                   input_size: int, output_buffer: bytearray,
+                   output_size: int) -> None:
+    """Handle local storage operations"""
+    try:
+        method_upper = (method or "").upper()
+        req_path = path or ""
+
+        # If this is a PUT to null/empty root path, pass to nonvolatile
+        if method_upper == "PUT" and (req_path == "" or req_path == "/"):
+            jetstream_nonvolatile(path, query_strings, method, http_params,
+                                  input_buffer, input_size, output_buffer, output_size)
+            return
+
+        # Validate path format: /<sha256>.dat
+        m = re.fullmatch(r"/([0-9a-fA-F]{64})\.dat", req_path)
+        if m:
+            # For GET/HEAD/DELETE on hashed paths, always go through nonvolatile
+            if method_upper in ("GET", "HEAD", "DELETE"):
+                jetstream_nonvolatile(path, query_strings, method, http_params,
+                                      input_buffer, input_size, output_buffer, output_size)
+                return
+
+            # For writes, if body present and matches path hash -> nonvolatile; else volatile
+            if method_upper in ("PUT", "POST", "PUSH"):
+                if input_size and input_buffer is not None:
+                    body_sha = hashlib.sha256(input_buffer).hexdigest()
+                    if body_sha.lower() == m.group(1).lower():
+                        # Hash matches content -> treat as nonvolatile
+                        jetstream_nonvolatile(path, query_strings, method, http_params,
+                                              input_buffer, input_size, output_buffer, output_size)
+                        return
+                # Hash does not match content -> volatile
+                jetstream_volatile(path, query_strings, method, http_params,
+                                   input_buffer, input_size, output_buffer, output_size)
+                return
+
+            # Other methods on hashed path default to nonvolatile
+            jetstream_nonvolatile(path, query_strings, method, http_params,
+                                  input_buffer, input_size, output_buffer, output_size)
+            return
+
+        # Path not in /sha256.dat format -> volatile
+        jetstream_volatile(path, query_strings, method, http_params,
+                           input_buffer, input_size, output_buffer, output_size)
+    except Exception:
+        # On any error, fall back to volatile handling
+        jetstream_volatile(path, query_strings, method, http_params,
+                           input_buffer, input_size, output_buffer, output_size)
+
+
+def jetstream_restore(path: str, query_strings: List[str], method: str,
+                     http_params: List[str], input_buffer: bytes,
+                     input_size: int, output_buffer: bytearray,
+                     output_size: int) -> None:
+    """Handle restore operations"""
+    # Empty implementation as requested
+    pass
+
+
+def jetstream_remote(path: str, query_strings: List[str], method: str,
+                    http_params: List[str], input_buffer: bytes,
+                    input_size: int, output_buffer: bytearray,
+                    output_size: int) -> None:
+    """Handle remote operations - passes through to restore, local, nonvolatile, volatile"""
+    # Delegate to local, which decides volatile vs nonvolatile.
+    jetstream_local(path, query_strings, method, http_params,
+                   input_buffer, input_size, output_buffer, output_size)
+
+
+def jetstream_application(path: str, query_strings: List[str], method: str,
+                         http_params: List[str], input_buffer: bytes,
+                         input_size: int, output_buffer: bytearray,
+                         output_size: int) -> None:
+    """Application layer - passes through to jetstream_remote"""
+    # Burst GET handling: if burst=1 query param on GET, treat body as list of paths
+    try:
+        method_upper = (method or "").upper()
+
+        def has_burst(qs: List[str]) -> bool:
+            for item in qs or []:
+                if "=" in item:
+                    k, v = item.split("=", 1)
+                else:
+                    k, v = item, ""
+                if k == "burst" and v == "1":
+                    return True
+            return False
+
+        def remove_burst(qs: List[str]) -> List[str]:
+            res: List[str] = []
+            for item in qs or []:
+                if "=" in item:
+                    k, v = item.split("=", 1)
+                else:
+                    k, v = item, ""
+                if not (k == "burst" and v == "1"):
+                    res.append(item)
+            return res
+
+        if method_upper == "GET" and has_burst(query_strings):
+            # First, get the index content via remote into a temporary buffer
+            tmp_index = bytearray(output_size)
+            jetstream_remote(path, query_strings, method, http_params,
+                             input_buffer, input_size, tmp_index, output_size)
+
+            # Extract actual length up to first null byte
+            try:
+                idx_len = tmp_index.index(0)
+            except ValueError:
+                idx_len = len(tmp_index)
+            index_text = tmp_index[:idx_len].decode('utf-8', errors='ignore')
+
+            # Prepare to concatenate chunks
+            remaining = output_size
+            write_pos = 0
+            chunk_qs = remove_burst(query_strings)
+
+            # Iterate over each valid /sha256.dat line
+            for line in index_text.splitlines():
+                line = line.strip()
+                if not re.fullmatch(r"/([0-9a-fA-F]{64})\.dat", line or ""):
+                    continue
+                if remaining <= 0:
+                    break
+                # Fetch this chunk via remote call
+                tmp_chunk = bytearray(remaining)
+                jetstream_remote(line, chunk_qs, "GET", http_params,
+                                 b"", 0, tmp_chunk, remaining)
+                # Determine content length up to first null
+                try:
+                    chunk_len = tmp_chunk.index(0)
+                except ValueError:
+                    chunk_len = len(tmp_chunk)
+                if chunk_len <= 0:
+                    continue
+                # Copy into output buffer
+                end_pos = write_pos + chunk_len
+                output_buffer[write_pos:end_pos] = tmp_chunk[:chunk_len]
+                write_pos = end_pos
+                remaining = output_size - write_pos
+            return
+
+        # Burst write handling for PUT/POST
+        if method_upper in ("PUT", "POST") and has_burst(query_strings):
+            # Split input_buffer into 4096-byte blocks and store each via remote
+            BLOCK_SIZE = 4096
+            index_lines: list[str] = []
+            # Iterate over the input buffer length as indicated by input_size
+            offset = 0
+            while offset < input_size:
+                end = min(offset + BLOCK_SIZE, input_size)
+                chunk = input_buffer[offset:end]
+                offset = end
+                # Store this chunk via remote with empty path (special put handled downstream)
+                tmp_resp = bytearray(256)  # response should be a short path
+                jetstream_remote("", remove_burst(query_strings), method, http_params,
+                                 chunk, len(chunk), tmp_resp, len(tmp_resp))
+                # Determine response text up to first null
+                try:
+                    resp_len = tmp_resp.index(0)
+                except ValueError:
+                    resp_len = len(tmp_resp)
+                resp_text = tmp_resp[:resp_len].decode('utf-8', errors='ignore').strip()
+                # Accept only valid /sha256.dat entries
+                if re.fullmatch(r"/([0-9a-fA-F]{64})\.dat", resp_text or ""):
+                    index_lines.append(resp_text)
+                else:
+                    # If any chunk write fails to return a valid path, abort with empty output
+                    return
+
+            # Compose newline-separated index
+            index_body = ("\n".join(index_lines)).encode('utf-8')
+
+            # Store the index at the original path via remote (without burst param)
+            tmp_final = bytearray(output_size)
+            jetstream_remote(path, remove_burst(query_strings), method, http_params,
+                             index_body, len(index_body), tmp_final, output_size)
+            # Copy the final response into output_buffer
+            try:
+                final_len = tmp_final.index(0)
+            except ValueError:
+                final_len = len(tmp_final)
+            n = min(final_len, output_size)
+            output_buffer[:n] = tmp_final[:n]
+            return
+
+        # Default: pass through transparently to jetstream_remote
+        jetstream_remote(path, query_strings, method, http_params,
+                         input_buffer, input_size, output_buffer, output_size)
+
+        # After a write, check if we hit a write channel and need to redirect
+        if method_upper in ("PUT", "POST", "PUSH"):
+            # Determine current output length
+            try:
+                out_len = output_buffer.index(0)
+            except ValueError:
+                out_len = output_size
+            marker_text = output_buffer[:out_len].decode('utf-8', errors='ignore').strip()
+            
+            # Check for write channel redirection
+            m = re.fullmatch(r"Write channel\s+(/([0-9a-fA-F]{64})\.dat)", marker_text)
+            if m:
+                target_path = m.group(1)
+                # Perform redirected write to the target path with original body and query params
+                # Use a temporary buffer to capture the redirected response, then copy back
+                tmp = bytearray(output_size)
+                jetstream_remote(target_path, query_strings, method, http_params,
+                                 input_buffer, input_size, tmp, output_size)
+                # After successful redirection, return the channel path instead of target path
+                channel_path_bytes = path.encode('utf-8')
+                n = min(len(channel_path_bytes), output_size)
+                output_buffer[:n] = channel_path_bytes[:n]
+                # If channel path shorter than previous, zero out the rest to keep terminator
+                if n < output_size:
+                    output_buffer[n:n+1] = b"\x00"
+                return
+            
+            # Check for append channel redirection
+            m = re.fullmatch(r"Append channel\s+(/([0-9a-fA-F]{64})\.dat)", marker_text)
+            if m:
+                target_path = m.group(1)
+                # Perform redirected append to the target path with original body and query params
+                # Add append=1 to the query strings for the redirected call
+                append_query = list(query_strings or [])
+                append_query.append("append=1")
+                tmp = bytearray(output_size)
+                jetstream_remote(target_path, append_query, method, http_params,
+                                 input_buffer, input_size, tmp, output_size)
+                # After successful redirection, return the channel path instead of target path
+                channel_path_bytes = path.encode('utf-8')
+                n = min(len(channel_path_bytes), output_size)
+                output_buffer[:n] = channel_path_bytes[:n]
+                # If channel path shorter than previous, zero out the rest to keep terminator
+                if n < output_size:
+                    output_buffer[n:n+1] = b"\x00"
+
+        # After a read, check if we hit a read channel and need to redirect
+        if method_upper in ("GET", "HEAD"):
+            try:
+                out_len = output_buffer.index(0)
+            except ValueError:
+                out_len = output_size
+            marker_text = output_buffer[:out_len].decode('utf-8', errors='ignore').strip()
+            m = re.fullmatch(r"Read channel\s+(/([0-9a-fA-F]{64})\.dat)", marker_text)
+            if m:
+                target_path = m.group(1)
+                tmp = bytearray(output_size)
+                jetstream_remote(target_path, query_strings, "GET", http_params,
+                                 b"", 0, tmp, output_size)
+                try:
+                    n = tmp.index(0)
+                except ValueError:
+                    n = len(tmp)
+                n = min(n, output_size)
+                output_buffer[:n] = tmp[:n]
+                if n < output_size:
+                    output_buffer[n:n+1] = b"\x00"
+        
+    except Exception:
+        # On any error, fall back to transparent pass-through
+        jetstream_remote(path, query_strings, method, http_params,
+                         input_buffer, input_size, output_buffer, output_size)
+class JetStreamHandler(BaseHTTPRequestHandler):
+    """HTTP request handler for JetStream database operations"""
+    
+    def _handle_request(self) -> None:
+        """Common request handling logic"""
+        try:
+            # Parse the URL and query parameters
+            parsed_url = urlparse(self.path)
+            path = parsed_url.path
+            query_params = parse_qs(parsed_url.query)
+            
+            # Convert query parameters to list of "key=value" strings
+            query_strings = []
+            for key, values in query_params.items():
+                for value in values:
+                    query_strings.append(f"{key}={value}")
+            
+            # Get HTTP headers as parameters
+            http_params = []
+            for header, value in self.headers.items():
+                http_params.append(f"{header}={value}")
+            
+            # Read request body
+            content_length = int(self.headers.get('Content-Length', 0))
+            input_buffer = self.rfile.read(content_length) if content_length > 0 else b''
+            input_size = len(input_buffer)
+            
+            # Prepare output buffer
+            output_buffer = bytearray(65536)  # 64KB buffer
+            output_size = len(output_buffer)
+            
+            # Call jetstream_application
+            jetstream_application(path, query_strings, self.command, http_params,
+                                input_buffer, input_size, output_buffer, output_size)
+            
+            # Send response
+            self.send_response(200)
+            self.send_header('Content-Type', 'application/octet-stream')
+            self.end_headers()
+            
+            # Find the actual content length in output_buffer (up to first null byte)
+            try:
+                actual_length = output_buffer.index(0)
+            except ValueError:
+                actual_length = len(output_buffer)
+            
+            self.wfile.write(output_buffer[:actual_length])
+            
+        except Exception as e:
+            self.send_error(500, f"Internal Server Error: {str(e)}")
+    
+    def do_GET(self) -> None:
+        """Handle GET requests"""
+        self._handle_request()
+    
+    def do_POST(self) -> None:
+        """Handle POST requests"""
+        self._handle_request()
+    
+    def do_PUT(self) -> None:
+        """Handle PUT requests"""
+        self._handle_request()
+    
+    def do_DELETE(self) -> None:
+        """Handle DELETE requests"""
+        self._handle_request()
+    
+    def do_PATCH(self) -> None:
+        """Handle PATCH requests"""
+        self._handle_request()
+    
+    def log_message(self, format: str, *args: Any) -> None:
+        """Override to customize logging"""
+        print(f"[{self.address_string()}] {format % args}")
+
+
+def jetstream_server() -> None:
+    """Main server function that handles TLS/HTTP connections"""
+    # Check for TLS certificates
+    tls_key_path = "/etc/ssl/jetstream.key"
+    tls_cert_path = "/etc/ssl/jetstream.crt"
+    
+    use_tls = os.path.exists(tls_key_path) and os.path.exists(tls_cert_path)
+    port = 443 if use_tls else 7777
+    
+    print(f"Starting JetStream server on port {port}")
+    print(f"TLS enabled: {use_tls}")
+    
+    # Create HTTP server
+    server = HTTPServer(('0.0.0.0', port), JetStreamHandler)
+    
+    # Configure TLS if certificates exist
+    if use_tls:
+        try:
+            context = ssl.create_default_context(ssl.Purpose.CLIENT_AUTH)
+            context.load_cert_chain(tls_cert_path, tls_key_path)
+            server.socket = context.wrap_socket(server.socket, server_side=True)
+            print("TLS configured successfully")
+        except Exception as e:
+            print(f"Failed to configure TLS: {e}")
+            print("Falling back to HTTP on port 7777")
+            server.server_close()
+            server = HTTPServer(('0.0.0.0', 7777), JetStreamHandler)
+    
+    print(f"JetStream server listening on {'https' if use_tls else 'http'}://0.0.0.0:{server.server_port}")
+
+    # Start watchdog thread
+    def _watchdog_loop():
+        while True:
+            try:
+                now = time.time()
+                if os.path.isdir(DATA):
+                    with os.scandir(DATA) as it:
+                        for entry in it:
+                            try:
+                                if not entry.is_file(follow_symlinks=False):
+                                    continue
+                                st = entry.stat(follow_symlinks=False)
+                                # Delete if older than TTL
+                                if now - st.st_mtime > WATCHDOG_TTL_SECONDS:
+                                    os.remove(entry.path)
+                            except FileNotFoundError:
+                                continue
+                            except Exception:
+                                # Ignore watchdog errors for robustness
+                                continue
             except Exception:
                 pass
+            time.sleep(WATCHDOG_TTL_SECONDS)
 
-# --- Helpers ---
-sha256 = lambda b: hashlib.sha256(b).hexdigest()
-
-def is_valid_root_hash_extension(p):
-    # Path validation is strict, must be /<sha256>.<ext>
-    return p.startswith('/') and p.endswith(fileExtension) and len(p) == len(f"/{sha256(b'')}{fileExtension}")
-
-def get_depth(r):
-    try:
-        qs = urllib.parse.urlparse(r.path).query
-        v = urllib.parse.parse_qs(qs).get(depthCall, [""])[0]
-        if v == "": return 0
-        d = max(0, int(v))
-        return min(d, len(nodes) - 1)
-    except (ValueError, IndexError):
-        return 0
-
-def quantum_ok(): time.sleep(0.002)
-def quantum_err(): time.sleep(0.012)
-
-class SilentResponseWriter:
-    def __init__(self):
-        self.headers = {}
-        self.body = bytearray()
-
-    def send_response(self, code):
-        pass
-
-    def send_header(self, key, value):
-        self.headers[key] = value
-
-    def end_headers(self):
-        pass
-
-    def write(self, data):
-        self.body.extend(data)
-        return len(data)
-
-def auth_fail(handler):
-    ref = os.getenv("APIKEY", "")
-    if not ref:
-        try:
-            with open(os.path.join(root, "apikey"), "r") as f:
-                ref = f.read().strip()
-        except FileNotFoundError:
-            ref = ""
-    api = handler.q.get("apikey", [""])[0]
-    if ref != api:
-        quantum_err()
-        handler.send_response(401)
-        handler.end_headers()
-        return True
-    quantum_ok()
-    return False
-
-def formatted(query, shortName):
-    fmt = query.get("format", ["*"])[0] or "*"
-    # Replicate Go's strings.Replace with count=1
-    return fmt.replace("*", "/" + shortName, 1)
-
-def is_call_routed(r):
-    qs = urllib.parse.urlparse(r.path).query
-    return routedCall in urllib.parse.parse_qs(qs)
-
-def mark_as_used(handler, file_path):
-    chtimes = handler.q.get("chtimes", ["1"])[0]
-    if chtimes != "0":
-        now = time.time()
-        try:
-            os.utime(file_path, (now, now))
-        except OSError:
-            pass
-
-# --- Storage ops ---
-
-def write_nonvolatile(handler, body):
-    shortName = f"{sha256(body)}{fileExtension}"
-    p = os.path.join(root, shortName)
-    try:
-        with open(p, "xb") as f:
-            f.write(body)
-    except FileExistsError:
-        pass # If it exists, we're good. Content-addressing means it's the same file.
-    handler.wfile.write(formatted(handler.q, shortName).encode())
-
-def write_volatile(handler, body):
-    up = urllib.parse.urlparse(handler.path)
-    shortName = up.path[1:]
-    p = os.path.join(root, shortName)
+    threading.Thread(target=_watchdog_loop, name="jetstream_watchdog", daemon=True).start()
     
     try:
-        data = open(p, 'rb').read()
-        # Disallow updating secure hashed segments already stored.
-        if f"{sha256(data)}{fileExtension}" == shortName:
-            quantum_err()
-            return
-    except FileNotFoundError:
-        data = b''
+        # Handle multiple connections simultaneously using threading
+        server.serve_forever()
+    except KeyboardInterrupt:
+        print("\nShutting down JetStream server...")
+        server.server_close()
 
-    if len(data) < 120:
-        if data.startswith(ReadOnlySecret.encode()):
-            return
-        if data.startswith(WriteOnlySecret.encode()):
-            secretHash = data[len(WriteOnlySecret):].decode()
-            if is_valid_root_hash_extension(secretHash) and cluster:
-                url = cluster + secretHash + ("?" + up.query if up.query else "")
-                try:
-                    request_with_pinned_ip(url, method="PUT", data=body)
-                    handler.wfile.write(up.path.encode())
-                except Exception:
-                    pass
-            return
-        if data.startswith(AppendOnlySecret.encode()):
-            if handler.q.get("append", ["0"])[0] != "1":
-                return
-            secretHash = data[len(AppendOnlySecret):].decode()
-            if is_valid_root_hash_extension(secretHash) and cluster:
-                url = cluster + secretHash + ("?" + up.query if up.query else "")
-                try:
-                    request_with_pinned_ip(url, method="PUT", data=body)
-                    handler.wfile.write(up.path.encode())
-                except Exception:
-                    pass
-            return
 
-    setifnot = handler.q.get("setifnot", ["0"])[0] == "1"
-    append = handler.q.get("append", ["0"])[0] == "1"
-    mode = 'ab' if append else ('xb' if setifnot else 'wb')
-    try:
-        with open(p, mode) as f:
-            f.write(body)
-    except FileExistsError:
-        if setifnot:
-            return # Don't write on setifnot if file exists
-    except IOError:
-        return # Other write errors
-    handler.wfile.write(formatted(handler.q, shortName).encode())
-
-def delete_volatile(handler):
-    up = urllib.parse.urlparse(handler.path)
-    if not up.path or len(up.path) <= 1:
-        return False
-    shortName = up.path[1:]
-    p = os.path.join(root, shortName)
-    try:
-        data = open(p, 'rb').read()
-        if f"{sha256(data)}{fileExtension}" == shortName:
-            quantum_err()
-            return False
-        if len(data) < 120 and (data.startswith(ReadOnlySecret.encode()) or data.startswith(WriteOnlySecret.encode()) or data.startswith(AppendOnlySecret.encode())):
-            quantum_err()
-            return False
-        os.remove(p)
-        return True
-    except (FileNotFoundError, OSError):
-        return False
-
-def read_store(handler):
-    up = urllib.parse.urlparse(handler.path)
-    if not is_valid_root_hash_extension(up.path):
-        handler.send_response(417)
-        handler.end_headers()
-        return
-
-    p = os.path.join(root, up.path[1:])
-    try:
-        data = open(p, 'rb').read()
-    except FileNotFoundError:
-        quantum_err()
-        handler.send_response(404)
-        handler.end_headers()
-        return
-
-    if len(data) < 120:
-        if data.startswith(WriteOnlySecret.encode()) or data.startswith(AppendOnlySecret.encode()):
-            handler.send_response(403)
-            handler.end_headers()
-            return
-        if data.startswith(ReadOnlySecret.encode()):
-            sh = data[len(ReadOnlySecret):].decode().strip()
-            if is_valid_root_hash_extension(sh) and cluster:
-                try:
-                    resp = request_with_pinned_ip(cluster + sh, method='GET')
-                    if resp.status == 200:
-                        data = resp.read()
-                    else:
-                        handler.send_response(403); handler.end_headers(); return
-                except Exception:
-                    handler.send_response(403); handler.end_headers(); return
-
-    handler.send_response(200)
-    mt = handler.q.get("Content-Type", ["application/octet-stream"])[0]
-    handler.send_header("Content-Type", mt)
-    handler.send_header("Cache-Control", "no-store, no-cache, must-revalidate, post-check=0, pre-check=0")
-    handler.send_header("Pragma", "no-cache")
-    handler.send_header("Expires", "0")
-    handler.end_headers()
-
-    if handler.q.get("burst", ["0"])[0] == "1":
-        lines = data.decode(errors='ignore').splitlines()
-        for line in lines:
-            line = line.strip()
-            if is_valid_root_hash_extension(line):
-                if cluster:
-                    try:
-                        print(f"Burst read from cluster: {cluster + line}")
-                        resp = request_with_pinned_ip(cluster + line)
-                        if resp.status == 200:
-                            handler.wfile.write(resp.read())
-                    except Exception as e:
-                        print(f"Error during burst read: {e}")
-                        pass # Ignore errors and continue
-    else:
-        handler.wfile.write(data)
-        mark_as_used(handler, p)
-
-    if handler.q.get("take", ["0"])[0] == "1":
-        delete_volatile(handler)
-
-# --- Replication ---
-
-def merge_and_bump(base_url, handler):
-    uph = urllib.parse.urlparse(handler.path)
-    d = get_depth(handler) + 1
-    u = urllib.parse.urlparse(base_url)
-    base = f"{u.scheme or 'http'}://{u.netloc or u.path}"
-    q = urllib.parse.parse_qs(u.query)
-    rq = urllib.parse.parse_qs(uph.query)
-    for k, vs in rq.items():
-        q.setdefault(k, []).extend(vs)
-    q[depthCall] = [str(d)]
-    qs = urllib.parse.urlencode([(k, v) for k, vs in q.items() for v in vs], doseq=True)
-    return f"{base}{uph.path}?{qs}" if qs else f"{base}{uph.path}"
-
-def backup_to_chain(base_url, handler, body):
-    url = merge_and_bump(base_url, handler)
-    print(f"Backup to chain: {url}")
-    try:
-        headers = {k: v for k, v in handler.headers.items() if k.lower() != 'host'}
-        request_with_pinned_ip(url, method=handler.command, data=body, headers=headers)
-    except Exception:
-        pass
-
-def delete_to_chain(base_url, handler):
-    url = merge_and_bump(base_url, handler)
-    print(f"Delete to chain: {url}")
-    try:
-        headers = {k: v for k, v in handler.headers.items() if k.lower() != 'host'}
-        request_with_pinned_ip(url, method="DELETE", headers=headers)
-    except Exception:
-        pass
-
-def restore_from_chain(base_url, handler):
-    url = merge_and_bump(base_url, handler)
-    print(f"Restore from chain: {url}")
-    try:
-        headers = {k: v for k, v in handler.headers.items() if k.lower() != 'host'}
-        resp = request_with_pinned_ip(url, method="GET", headers=headers)
-        if resp.status == 200:
-            body = resp.read()
-            sw = SilentResponseWriter()
-            
-            class HandlerDouble:
-                def __init__(self):
-                    self.path = handler.path
-                    self.q = handler.q
-                    self.wfile = sw
-                def send_response(self, code): pass
-                def send_header(self, k, v): pass
-                def end_headers(self): pass
-
-            if is_valid_root_hash_extension(handler.path):
-                write_volatile(HandlerDouble(), body)
-            else:
-                write_nonvolatile(HandlerDouble(), body)
-    except Exception:
-        pass
-
-def distributed_address(r, body_hash, cluster_address):
-    up = urllib.parse.urlparse(r.path)
-    u = urllib.parse.urlparse(cluster_address)
-    base = f"{u.scheme or 'http'}://{u.netloc or u.path}"
-    
-    q = urllib.parse.parse_qs(u.query)
-    rq = urllib.parse.parse_qs(up.query)
-    for k, vs in rq.items():
-        q.setdefault(k, []).extend(vs)
-    q[routedCall] = [instance]
-    
-    qs = urllib.parse.urlencode([(k, v) for k, vs in q.items() for v in vs], doseq=True)
-    
-    verify_path = up.path
-    if r.command in ["PUT", "POST"] and (up.path == "/" or up.path == ""):
-        verify_path = "/" + body_hash
-        
-    verify_address = f"{base}{verify_path}?{qs}" if qs else f"{base}{verify_path}"
-    forward_address = f"{base}{up.path}?{qs}" if qs else f"{base}{up.path}"
-    
-    return verify_address, forward_address
-
-def distributed_check(url):
-    try:
-        resp = request_with_pinned_ip(url, method="HEAD")
-        return resp.status == 200
-    except Exception:
-        return False
-
-def distributed_call(handler, method, body, url):
-    try:
-        resp = request_with_pinned_ip(url, method=method, data=body)
-        handler.send_response(resp.status)
-        for k, v in resp.headers.items():
-            handler.send_header(k, v)
-        handler.end_headers()
-        if method != "HEAD":
-            handler.wfile.write(resp.read())
-        return True
-    except Exception:
-        handler.send_response(500)
-        handler.end_headers()
-        return False
-
-# --- Handler ---
-
-class JetHandler(BaseHTTPRequestHandler):
-    def do_HEAD(self): self._process()
-    def do_GET(self): self._process()
-    def do_PUT(self): self._process()
-    def do_POST(self): self._process()
-    def do_DELETE(self): self._process()
-
-    def _process(self):
-        up = urllib.parse.urlparse(self.path)
-        if ".." in up.path or "./" in up.path:
-            self.send_response(400); self.end_headers(); return
-        
-        self.q = urllib.parse.parse_qs(up.query)
-        depth = get_depth(self)
-        
-        if nodes and depth < len(nodes) and len(nodes[depth]) > 1 and not is_call_routed(self):
-            self.fulfill_request_by_cluster()
-            return
-
-        buffer = level1Pool.get()
-        try:
-            body = None
-            if self.command in ["PUT", "POST"]:
-                length = min(int(self.headers.get('Content-Length', '0') or '0'), MaxFileSize)
-                if length > 0:
-                    body = self.rfile.read(length)
-            self.fulfill_request_locally(body)
-        finally:
-            level1Pool.put(bytearray(MaxFileSize))
-
-    def fulfill_request_locally(self, body):
-        if self.command in ["PUT", "POST"]:
-            if self.path == "/kv":
-                shortName = f"{sha256(body)}{fileExtension}"
-                self.send_response(200); self.end_headers()
-                self.wfile.write(f"/{shortName}".encode())
-                return
-            if auth_fail(self): return
-            self.send_response(200); self.end_headers()
-            if is_valid_root_hash_extension(self.path):
-                write_volatile(self, body)
-            else:
-                write_nonvolatile(self, body)
-            
-            depth = get_depth(self)
-            if (depth + 1) < len(nodes) and nodes[depth + 1]:
-                bc = random.choice(nodes[depth + 1])
-                backup_to_chain(bc, self, body)
-            return
-
-        if self.command == "DELETE":
-            if not is_valid_root_hash_extension(self.path):
-                self.send_response(417); self.end_headers(); return
-            if auth_fail(self): return
-            if delete_volatile(self):
-                self.send_response(200); self.end_headers()
-                self.wfile.write(self.path.encode())
-            else:
-                self.send_response(200); self.end_headers()
-
-            depth = get_depth(self)
-            if (depth + 1) < len(nodes) and nodes[depth + 1]:
-                bc = random.choice(nodes[depth + 1])
-                delete_to_chain(bc, self)
-            return
-
-        depth = get_depth(self)
-        next_depth = depth + 1
-        if next_depth < len(nodes) and nodes[next_depth] and time.time() < (startupTime + retention) and not is_call_routed(self):
-            if self.command in ["HEAD", "GET"] and is_valid_root_hash_extension(self.path):
-                p = os.path.join(root, self.path[1:])
-                if not os.path.exists(p):
-                    rc = random.choice(nodes[next_depth])
-                    restore_from_chain(rc, self)
-
-        if self.command == "HEAD":
-            if not is_valid_root_hash_extension(self.path):
-                self.send_response(417); self.end_headers(); return
-            p = os.path.join(root, self.path[1:])
-            if os.path.exists(p):
-                quantum_ok(); self.send_response(200); self.end_headers()
-            else:
-                quantum_err(); self.send_response(404); self.end_headers()
-            return
-
-        if self.command == "GET":
-            if self.path == "/":
-                if auth_fail(self): return
-                return
-            else:
-                read_store(self)
-                if self.q.get("take", ["0"])[0] == "1":
-                    delete_volatile(self)
-
-    def fulfill_request_by_cluster(self):
-        buffer = level2Pool.get()
-        try:
-            body = None
-            if self.command in ["PUT", "POST"]:
-                length = min(int(self.headers.get('Content-Length', '0') or '0'), MaxFileSize)
-                if length > 0:
-                    body = self.rfile.read(length)
-            
-            body_hash = sha256(body if body else b'') + fileExtension
-            
-            remote_address = ""
-            depth = get_depth(self)
-            node_list = nodes[depth] if 0 <= depth < len(nodes) else []
-            
-            for cluster_address in node_list:
-                verify_addr, forward_addr = distributed_address(self, body_hash, cluster_address)
-                if distributed_check(verify_addr):
-                    remote_address = forward_addr
-                    break
-            
-            if remote_address:
-                distributed_call(self, self.command, body, remote_address)
-            else:
-                self.fulfill_request_locally(body)
-        finally:
-            level2Pool.put(bytearray(MaxFileSize))
-
-# --- Maintenance ---
-
-def cleanup():
-    while True:
-        now = time.time()
-        try:
-            files = os.listdir(root)
-            for v in files:
-                if is_valid_root_hash_extension("/" + v):
-                    p = os.path.join(root, v)
-                    try:
-                        if os.stat(p).st_mtime + retention < now:
-                            os.remove(p)
-                    except OSError:
-                        pass
-            
-            sleep_duration = retention
-            if len(files) > 0:
-                # This logic is from the Go version to spread out the load
-                sleep_duration = (retention / len(files)) / 10
-            time.sleep(max(0.1, sleep_duration))
-        except Exception:
-            time.sleep(retention)
-
-def setup():
-    if not os.path.exists(root):
-        try:
-            os.makedirs(root, exist_ok=True)
-        except OSError:
-            pass
-    
-    for _ in range(pool_size):
-        level1Pool.put(bytearray(MaxFileSize))
-    
-    need_level2 = any(len(grp) > 1 for grp in nodes)
-    if need_level2:
-        for _ in range(pool_size):
-            level2Pool.put(bytearray(MaxFileSize))
-
-    threading.Thread(target=cleanup, daemon=True).start()
-
-# --- Run ---
 if __name__ == "__main__":
-    if not os.path.exists(root):
-        # Fallback for environments where /data is not writable
-        if os.access("/tmp", os.W_OK):
-            root = "/tmp"
-    setup()
-    key = f"/etc/ssl/{sslLocation}.key"
-    crt = f"/etc/ssl/{sslLocation}.crt"
-    use_ssl = os.path.exists(key) and os.path.exists(crt)
-    
-    port = 443 if use_ssl else 7777
-    srv = ThreadingHTTPServer(("", port), JetHandler)
-    
-    if use_ssl:
-        srv.socket = ssl.wrap_socket(srv.socket, keyfile=key, certfile=crt, server_side=True)
-    
-    print(f"Server starting on port {port}...")
-    srv.serve_forever()
+    jetstream_server()
