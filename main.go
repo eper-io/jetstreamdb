@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"io"
 	"log"
+	"math/rand"
 	"net/http"
 	"net/url"
 	"os"
@@ -25,7 +26,73 @@ const MAX_FILE_SIZE = 1024 * 1024
 // Watchdog cleanup interval (60 seconds)
 const WATCHDOG_INTERVAL = 60 * time.Second
 
+// Watchdog timeout period for restore
+const WATCHDOG_TIMEOUT = 60 * time.Second
+
+// Global startup time
+var startupTime = time.Now()
+
 // File age threshold for cleanup (60 seconds)
+// Global backup IP array
+var BACKUP_IPS = []string{
+	"http://18.209.57.108@hour.schmied.us",
+}
+
+// Helper: choose random backup IP
+func getRandomBackupIP() string {
+	return BACKUP_IPS[int(time.Now().UnixNano())%len(BACKUP_IPS)]
+}
+
+// Helper: extract domain name from https://ip@name
+func extractDomain(url string) string {
+	parts := strings.Split(url, "@")
+	if len(parts) == 2 {
+		return parts[1]
+	}
+	return ""
+}
+
+// jetstream_backup: PUT file to backup IP at /sha256.dat
+func jetstream_backup(filePath, sha256Name string) {
+	backupIP := getRandomBackupIP()
+	var urlStr string
+	if strings.Contains(backupIP, "@") {
+		urlStr = fmt.Sprintf("%s/%s", strings.Split(backupIP, "@")[0], sha256Name)
+	} else {
+		urlStr = fmt.Sprintf("%s/%s", backupIP, sha256Name)
+	}
+
+	file, err := os.Open(filePath)
+	if err != nil {
+		return
+	}
+	defer file.Close()
+
+	req, err := http.NewRequest("PUT", urlStr, file)
+	if err != nil {
+		return
+	}
+	req.Header.Set("Content-Type", "application/octet-stream")
+
+	client := &http.Client{
+		Timeout: 30 * time.Second, // Add timeout for backup operations
+	}
+	// TLS verification if needed
+	if strings.HasPrefix(backupIP, "https://") && strings.Contains(backupIP, "@") {
+		domain := extractDomain(backupIP)
+		tr := &http.Transport{
+			TLSClientConfig: &tls.Config{ServerName: domain},
+		}
+		client.Transport = tr
+	}
+	
+	resp, err := client.Do(req)
+	if err != nil {
+		return
+	}
+	defer resp.Body.Close()
+}
+// Global backup IP array
 const FILE_AGE_THRESHOLD = 60 * time.Second
 
 // JetStream volatile storage function
@@ -236,7 +303,7 @@ func jetstream_volatile(path string, queryStrings []string, method string, httpP
 		// Read file content first to check for channels
 		content, err := os.ReadFile(fullPath)
 		if err != nil {
-			// File doesn't exist - return empty string
+			// File doesn't exist - this is expected, return empty string without logging
 			*outputBuffer = []byte("")
 			*outputSize = 0
 			return
@@ -523,7 +590,69 @@ func jetstream_local(path string, queryStrings []string, method string, httpPara
 
 // JetStream restore function
 func jetstream_restore(path string, queryStrings []string, method string, httpParams []string, inputBuffer []byte, inputSize int, outputBuffer *[]byte, outputSize *int) {
-	// Pass through to jetstream_local
+	// For GET requests to /sha256.dat files, try to fetch from backup IPs if file is missing
+	if method == "GET" && strings.HasPrefix(path, "/") && strings.HasSuffix(path, ".dat") {
+		// First check if file exists locally
+		fullPath := filepath.Join(DATA, filepath.Base(path))
+		if _, err := os.Stat(fullPath); err == nil {
+			// File exists locally, use jetstream_local
+			jetstream_local(path, queryStrings, method, httpParams, inputBuffer, inputSize, outputBuffer, outputSize)
+			return
+		}
+		
+		// File doesn't exist locally, try to restore from backup if within timeout
+		if time.Since(startupTime) < WATCHDOG_TIMEOUT {
+			// Try each backup IP randomly
+			indices := rand.Perm(len(BACKUP_IPS))
+			for _, idx := range indices {
+				backupIP := BACKUP_IPS[idx]
+				var urlStr string
+				if strings.Contains(backupIP, "@") {
+					urlStr = fmt.Sprintf("%s%s", strings.Split(backupIP, "@")[0], path)
+				} else {
+					urlStr = fmt.Sprintf("%s%s", backupIP, path)
+				}
+
+				client := &http.Client{Timeout: 10 * time.Second}
+				// TLS verification if needed
+				if strings.HasPrefix(backupIP, "https://") && strings.Contains(backupIP, "@") {
+					domain := extractDomain(backupIP)
+					tr := &http.Transport{
+						TLSClientConfig: &tls.Config{ServerName: domain},
+					}
+					client.Transport = tr
+				}
+				
+				resp, err := client.Get(urlStr)
+				if err != nil || resp.StatusCode != http.StatusOK {
+					if resp != nil {
+						resp.Body.Close()
+					}
+					continue
+				}
+				
+				data, err := io.ReadAll(io.LimitReader(resp.Body, MAX_FILE_SIZE))
+				resp.Body.Close()
+				if err != nil || len(data) == 0 {
+					continue
+				}
+				
+				// Save to /data/sha256.dat
+				shaFile := filepath.Join(DATA, filepath.Base(path))
+				err = os.WriteFile(shaFile, data, 0644)
+				if err != nil {
+					continue
+				}
+				
+				// Successfully restored, return the data
+				*outputBuffer = data
+				*outputSize = len(data)
+				return
+			}
+		}
+	}
+	
+	// Pass through to jetstream_local for normal operation or if restore failed
 	jetstream_local(path, queryStrings, method, httpParams, inputBuffer, inputSize, outputBuffer, outputSize)
 }
 
@@ -653,6 +782,19 @@ func jetstream_application(path string, queryStrings []string, method string, ht
 	// Call jetstream_remote for normal operation
 	jetstream_remote(path, queryStrings, method, httpParams, inputBuffer, inputSize, outputBuffer, outputSize)
 	
+	// For GET operations, check if the result is empty and attempt restore if within timeout
+	if method == "GET" && *outputSize == 0 && time.Since(startupTime) < WATCHDOG_TIMEOUT {
+		// Attempt restore for failed GET
+		var restoreBuffer []byte
+		var restoreSize int
+		jetstream_restore(path, queryStrings, method, httpParams, inputBuffer, inputSize, &restoreBuffer, &restoreSize)
+		if restoreSize > 0 {
+			*outputBuffer = restoreBuffer
+			*outputSize = restoreSize
+			// Don't return here, continue with channel processing
+		}
+	}
+	
 	// Check if the response is a write channel for PUT/POST operations (matching main.c logic)
 	if (method == "PUT" || method == "POST") && *outputSize > 15 {
 		response := string(*outputBuffer)
@@ -660,6 +802,17 @@ func jetstream_application(path string, queryStrings []string, method string, ht
 			// Extract the target path from "Write channel /sha256.dat"
 			targetPath := response[14:] // Skip "Write channel "
 			if strings.HasSuffix(targetPath, ".dat") && len(targetPath) == 69 && targetPath[0] == '/' {
+				// Check if target file exists for append operations before redirecting
+				if strings.Contains(strings.Join(queryStrings, "&"), "append=1") {
+					fullPath := filepath.Join(DATA, filepath.Base(targetPath))
+					if _, err := os.Stat(fullPath); os.IsNotExist(err) && time.Since(startupTime) < WATCHDOG_TIMEOUT {
+						// Target file doesn't exist, try restore first
+						var restoreBuffer []byte
+						var restoreSize int
+						jetstream_restore(targetPath, []string{}, "GET", httpParams, []byte{}, 0, &restoreBuffer, &restoreSize)
+					}
+				}
+				
 				// Call jetstream_remote with the redirected path
 				jetstream_remote(targetPath, queryStrings, method, httpParams, inputBuffer, inputSize, outputBuffer, outputSize)
 				// Return the channel path to hide the target (format response path)
@@ -678,6 +831,15 @@ func jetstream_application(path string, queryStrings []string, method string, ht
 			// Extract the target path from "Append channel /sha256.dat"
 			targetPath := response[15:] // Skip "Append channel "
 			if strings.HasSuffix(targetPath, ".dat") && len(targetPath) == 69 && targetPath[0] == '/' {
+				// Check if target file exists before appending
+				fullPath := filepath.Join(DATA, filepath.Base(targetPath))
+				if _, err := os.Stat(fullPath); os.IsNotExist(err) && time.Since(startupTime) < WATCHDOG_TIMEOUT {
+					// Target file doesn't exist, try restore first
+					var restoreBuffer []byte
+					var restoreSize int
+					jetstream_restore(targetPath, []string{}, "GET", httpParams, []byte{}, 0, &restoreBuffer, &restoreSize)
+				}
+				
 				// Build query string with append=1 parameter
 				var appendQueryStrings []string
 				if len(queryStrings) > 0 && queryStrings[0] != "" {
@@ -710,6 +872,17 @@ func jetstream_application(path string, queryStrings []string, method string, ht
 			if strings.HasSuffix(targetPath, ".dat") && len(targetPath) == 69 && targetPath[0] == '/' {
 				// Call jetstream_remote with the redirected path to get target file content
 				jetstream_remote(targetPath, queryStrings, method, httpParams, inputBuffer, inputSize, outputBuffer, outputSize)
+				
+				// If read channel target failed and we got empty result, try restore
+				if *outputSize == 0 && time.Since(startupTime) < WATCHDOG_TIMEOUT {
+					var restoreBuffer []byte
+					var restoreSize int
+					jetstream_restore(targetPath, queryStrings, method, httpParams, inputBuffer, inputSize, &restoreBuffer, &restoreSize)
+					if restoreSize > 0 {
+						*outputBuffer = restoreBuffer
+						*outputSize = restoreSize
+					}
+				}
 				// Do NOT format response path - return the target file content directly
 				return
 			}
@@ -781,7 +954,7 @@ func watchdog() {
 		time.Sleep(WATCHDOG_INTERVAL)
 		
 		// Walk through data directory and clean up old files
-		err := filepath.Walk(DATA, func(path string, info os.FileInfo, err error) error {
+		filepath.Walk(DATA, func(path string, info os.FileInfo, err error) error {
 			if err != nil {
 				return nil // Continue walking even if there's an error
 			}
@@ -795,21 +968,29 @@ func watchdog() {
 			if time.Since(info.ModTime()) > FILE_AGE_THRESHOLD {
 				// Delete the file
 				os.Remove(path)
+			} else {
+				// Not deleted, backup
+				base := filepath.Base(path)
+				if strings.HasSuffix(base, ".dat") && len(base) == 68 {
+					sha256Name := base
+					jetstream_backup(path, sha256Name)
+				}
 			}
 			
 			return nil
 		})
 		
-		if err != nil {
-			log.Printf("Watchdog error: %v", err)
-		}
+		// Silently continue on errors
 	}
 }
 
 // JetStream server function
 func jetstream_server() {
 	// Ensure data directory exists
-	os.MkdirAll(DATA, 0755)
+	err := os.MkdirAll(DATA, 0755)
+	if err != nil {
+		log.Fatalf("Failed to create data directory %s: %v", DATA, err)
+	}
 	
 	// Start watchdog goroutine
 	go watchdog()
@@ -824,25 +1005,37 @@ func jetstream_server() {
 	if _, err := os.Stat(keyPath); err == nil {
 		if _, err := os.Stat(certPath); err == nil {
 			// TLS certificates exist, use HTTPS on port 443
-			log.Println("Starting HTTPS server on port 443")
 			
-			// Create TLS configuration
-			tlsConfig := &tls.Config{
-				MinVersion: tls.VersionTLS12,
-			}
+			// Validate certificates before starting server
+			_, err := tls.LoadX509KeyPair(certPath, keyPath)
+			if err == nil {
+				// Create TLS configuration
+				tlsConfig := &tls.Config{
+					MinVersion: tls.VersionTLS12,
+				}
 
-			server := &http.Server{
-				Addr:      ":443",
-				TLSConfig: tlsConfig,
-			}
+				server := &http.Server{
+					Addr:      ":443",
+					TLSConfig: tlsConfig,
+					ReadTimeout:  10 * time.Second,
+					WriteTimeout: 10 * time.Second,
+				}
 
-			log.Fatal(server.ListenAndServeTLS(certPath, keyPath))
+				fmt.Println("Starting HTTPS server on port 443")
+				log.Fatal(server.ListenAndServeTLS(certPath, keyPath))
+			}
 		}
 	}
 
-	// No TLS certificates, use HTTP on port 7777
-	log.Println("Starting HTTP server on port 7777")
-	log.Fatal(http.ListenAndServe(":7777", nil))
+	// No TLS certificates or TLS validation failed, use HTTP on port 7777
+	server := &http.Server{
+		Addr:         ":7777",
+		ReadTimeout:  10 * time.Second,
+		WriteTimeout: 10 * time.Second,
+	}
+	
+	fmt.Println("Starting HTTP server on port 7777")
+	log.Fatal(server.ListenAndServe())
 }
 
 func main() {

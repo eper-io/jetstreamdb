@@ -16,21 +16,99 @@
 #include <time.h>
 #include <utime.h>
 
+/*
+gcc -o main main.c -lpthread -lssl -lcrypto -lcurl -ljansson -Wl,-z,noexecstack && ./main
+cat main.c | grep gcc | head -n 1 | bash
+*/
+
 #define MAX_FILE_SIZE (1024 * 1024)  // 1 megabyte file size limit
 #define WATCHDOG_TIMEOUT 60          // 60 seconds watchdog timeout
 #define DATA "/data"                 // Data directory
 #define MAX_REQUEST_SIZE 8192        // Maximum HTTP request size
 #define MAX_RESPONSE_SIZE (2 * 1024 * 1024)  // Maximum response size
+#define MAX_CONCURRENT_CONNECTIONS 100  // Maximum concurrent connections
+
+// Global startup time
+static time_t startup_time;
+
+// Connection limiting
+static int active_connections = 0;
+static pthread_mutex_t connection_mutex = PTHREAD_MUTEX_INITIALIZER;
+
 // Node configuration (2D array of nodes)
-static const char* NODES[][2] = {
-    {"http://127.0.0.1:7777", NULL},  // First level nodes
-    {"https://hour.schmied.us:443", NULL}  // Second level nodes
+// Global backup IP array
+static const char* BACKUP_IPS[] = {
+    "http://18.209.57.108@hour.schmied.us"
+};
+static const int NUM_BACKUP_IPS = sizeof(BACKUP_IPS) / sizeof(BACKUP_IPS[0]);
+
+// Helper: choose random backup IP
+const char* get_random_backup_ip() {
+    srand((unsigned int)time(NULL) ^ getpid());
+    int idx = rand() % NUM_BACKUP_IPS;
+    return BACKUP_IPS[idx];
+}
+
+// Helper: extract domain name from https://ip@name
+const char* extract_domain(const char* url) {
+    const char* at = strchr(url, '@');
+    return at ? at + 1 : NULL;
+}
+
+#include <curl/curl.h>
+
+// Structure for cURL response data
+struct curl_response {
+    char* data;
+    size_t size;
 };
 
-/*
-gcc -o main main.c -lpthread -lssl -lcrypto -lcurl -ljansson && ./main
-cat main.c | grep gcc | head -n 1 | bash
-*/
+// Backup function: PUT file to backup IP at /sha256.dat
+void jetstream_backup(const char* file_path, const char* sha256_name) {
+    const char* backup_ip = get_random_backup_ip();
+    char url[512];
+    if (strchr(backup_ip, '@')) {
+        char ip_part[256];
+        strncpy(ip_part, backup_ip, strchr(backup_ip, '@') - backup_ip);
+        ip_part[strchr(backup_ip, '@') - backup_ip] = '\0';
+        snprintf(url, sizeof(url), "%s/%s", ip_part, sha256_name);
+    } else {
+        snprintf(url, sizeof(url), "%s/%s", backup_ip, sha256_name);
+    }
+
+    FILE* f = fopen(file_path, "rb");
+    if (!f) return;
+    fseek(f, 0, SEEK_END);
+    long size = ftell(f);
+    fseek(f, 0, SEEK_SET);
+    char* buf = malloc(size);
+    if (!buf) { fclose(f); return; }
+    fread(buf, 1, size, f);
+    fclose(f);
+
+    CURL* curl = curl_easy_init();
+    if (!curl) { free(buf); return; }
+    struct curl_slist* headers = NULL;
+    headers = curl_slist_append(headers, "Content-Type: application/octet-stream");
+    curl_easy_setopt(curl, CURLOPT_URL, url);
+    curl_easy_setopt(curl, CURLOPT_CUSTOMREQUEST, "PUT");
+    curl_easy_setopt(curl, CURLOPT_POSTFIELDS, buf);
+    curl_easy_setopt(curl, CURLOPT_POSTFIELDSIZE, size);
+    curl_easy_setopt(curl, CURLOPT_HTTPHEADER, headers);
+    // TLS verification if needed
+    if (strstr(backup_ip, "https://") && strchr(backup_ip, '@')) {
+        const char* domain = extract_domain(backup_ip);
+        if (domain) curl_easy_setopt(curl, CURLOPT_SSL_VERIFYHOST, 2L);
+        if (domain) curl_easy_setopt(curl, CURLOPT_SSL_VERIFYPEER, 1L);
+        if (domain) curl_easy_setopt(curl, CURLOPT_SSL_OPTIONS, CURLSSLOPT_NATIVE_CA);
+    }
+    curl_easy_perform(curl);
+    curl_slist_free_all(headers);
+    curl_easy_cleanup(curl);
+    free(buf);
+}
+
+// Global backup IP array
 
 // Structure for client connection data
 typedef struct {
@@ -228,6 +306,11 @@ void free_http_request(http_request_t* req) {
 // Handle client connection
 void* handle_client(void* arg) {
     client_connection_t* client = (client_connection_t*)arg;
+    // Set socket receive timeout (10 seconds)
+    struct timeval timeout;
+    timeout.tv_sec = 10;
+    timeout.tv_usec = 0;
+    setsockopt(client->socket, SOL_SOCKET, SO_RCVTIMEO, (const char*)&timeout, sizeof(timeout));
     char buffer[MAX_REQUEST_SIZE];
     char response[MAX_RESPONSE_SIZE];
     int bytes_read;
@@ -256,6 +339,7 @@ void* handle_client(void* arg) {
         } else {
             send(client->socket, error_response, strlen(error_response), 0);
         }
+        free_http_request(&request);
         goto cleanup;
     }
     
@@ -287,6 +371,11 @@ void* handle_client(void* arg) {
     free_http_request(&request);
     
 cleanup:
+    // Decrement active connection counter
+    pthread_mutex_lock(&connection_mutex);
+    active_connections--;
+    pthread_mutex_unlock(&connection_mutex);
+    
     if (client->ssl) {
         SSL_shutdown(client->ssl);
         SSL_free(client->ssl);
@@ -357,6 +446,7 @@ void jetstream_server(void) {
     server_socket = socket(AF_INET, SOCK_STREAM, 0);
     if (server_socket < 0) {
         perror("Socket creation failed");
+        if (ssl_ctx) SSL_CTX_free(ssl_ctx);
         return;
     }
     
@@ -373,6 +463,7 @@ void jetstream_server(void) {
     if (bind(server_socket, (struct sockaddr*)&server_addr, sizeof(server_addr)) < 0) {
         perror("Bind failed");
         close(server_socket);
+        if (ssl_ctx) SSL_CTX_free(ssl_ctx);
         return;
     }
     
@@ -380,6 +471,7 @@ void jetstream_server(void) {
     if (listen(server_socket, 10) < 0) {
         perror("Listen failed");
         close(server_socket);
+        if (ssl_ctx) SSL_CTX_free(ssl_ctx);
         return;
     }
     
@@ -396,8 +488,26 @@ void jetstream_server(void) {
             continue;
         }
         
+        // Check connection limit
+        pthread_mutex_lock(&connection_mutex);
+        if (active_connections >= MAX_CONCURRENT_CONNECTIONS) {
+            pthread_mutex_unlock(&connection_mutex);
+            close(client_socket);
+            continue;
+        }
+        active_connections++;
+        pthread_mutex_unlock(&connection_mutex);
+        
         // Create client connection structure
         client_connection_t* client = malloc(sizeof(client_connection_t));
+        if (!client) {
+            // Decrement counter on malloc failure
+            pthread_mutex_lock(&connection_mutex);
+            active_connections--;
+            pthread_mutex_unlock(&connection_mutex);
+            close(client_socket);
+            continue;
+        }
         client->socket = client_socket;
         client->address = client_addr;
         client->ssl = NULL;
@@ -409,6 +519,10 @@ void jetstream_server(void) {
                 SSL_free(client->ssl);
                 close(client_socket);
                 free(client);
+                // Decrement counter on SSL failure
+                pthread_mutex_lock(&connection_mutex);
+                active_connections--;
+                pthread_mutex_unlock(&connection_mutex);
                 continue;
             }
         }
@@ -480,6 +594,9 @@ void* watchdog_thread(void* arg) {
                 // Check if file is older than WATCHDOG_TIMEOUT seconds
                 if (current_time - file_stat.st_mtime > WATCHDOG_TIMEOUT) {
                     unlink(filepath); // Delete the file
+                } else {
+                    // Not deleted, backup
+                    jetstream_backup(filepath, entry->d_name);
                 }
             }
         }
@@ -885,14 +1002,14 @@ void jetstream_nonvolatile(const char* path, const char** query_strings, const c
             if (bytes_read > 0) {
                 char* file_hash = sha256_hex(file_buffer, bytes_read);
                 if (file_hash) {
-                    // Check if stored content hash matches the path
-                    char expected_path[256];
-                    snprintf(expected_path, sizeof(expected_path), "/%s.dat", file_hash);
+                    // Compare with path hash
+                    char path_hash[65];
+                    strncpy(path_hash, path + 1, 64);
+                    path_hash[64] = '\0';
                     
-                    if (strcmp(path, expected_path) == 0) {
-                        // Stored content hash matches path, ignore PUT request
-                        ((char*)output_buffer)[0] = '\0';
-                        free(content_hash);
+                    if (strcmp(path_hash, file_hash) == 0) {
+                        // Hashes match, proceed with delete
+                        jetstream_volatile(path, query_strings, method, http_params, input_buffer, input_size, output_buffer, output_size);
                         free(file_hash);
                         return;
                     }
@@ -962,7 +1079,118 @@ void jetstream_local(const char* path, const char** query_strings, const char* m
 void jetstream_restore(const char* path, const char** query_strings, const char* method,
                        const char** http_params, const void* input_buffer, size_t input_size,
                        void* output_buffer, size_t output_size) {
-    // Pass transparently to jetstream_local (which handles routing to nonvolatile/volatile)
+    // For GET requests to /sha256.dat files, try to fetch from backup IPs if file is missing
+    if (method && strcmp(method, "GET") == 0 && path && path[0] == '/' && strstr(path, ".dat")) {
+        // First check if file exists locally
+        char full_path[512];
+        snprintf(full_path, sizeof(full_path), "%s%s", DATA, strrchr(path, '/'));
+        
+        FILE* f = fopen(full_path, "rb");
+        if (f) {
+            // File exists locally, close and use jetstream_local
+            fclose(f);
+            jetstream_local(path, query_strings, method, http_params, input_buffer, input_size, output_buffer, output_size);
+            return;
+        }
+        
+        // File doesn't exist locally, try to restore from backup if within timeout
+        if (difftime(time(NULL), startup_time) < WATCHDOG_TIMEOUT) {
+            // Try each backup IP randomly
+            int indices[NUM_BACKUP_IPS];
+            for (int i = 0; i < NUM_BACKUP_IPS; i++) indices[i] = i;
+            
+            // Simple shuffle
+            for (int i = NUM_BACKUP_IPS - 1; i > 0; i--) {
+                int j = rand() % (i + 1);
+                int temp = indices[i];
+                indices[i] = indices[j];
+                indices[j] = temp;
+            }
+            
+            for (int i = 0; i < NUM_BACKUP_IPS; i++) {
+                const char* backup_ip = BACKUP_IPS[indices[i]];
+                char url[512];
+                
+                if (strchr(backup_ip, '@')) {
+                    char ip_part[256];
+                    strncpy(ip_part, backup_ip, strchr(backup_ip, '@') - backup_ip);
+                    ip_part[strchr(backup_ip, '@') - backup_ip] = '\0';
+                    snprintf(url, sizeof(url), "%s%s", ip_part, path);
+                } else {
+                    snprintf(url, sizeof(url), "%s%s", backup_ip, path);
+                }
+                
+                CURL* curl = curl_easy_init();
+                if (!curl) continue;
+                
+                // Set up response buffer
+                struct curl_response response = {0};
+                
+                // Callback to write response data
+                size_t write_callback(void* contents, size_t size, size_t nmemb, void* userp) {
+                    size_t realsize = size * nmemb;
+                    struct curl_response* mem = (struct curl_response*)userp;
+                    
+                    void* ptr = realloc(mem->data, mem->size + realsize + 1);
+                    if (!ptr) {
+                        // Out of memory
+                        free(mem->data);
+                        mem->data = NULL;
+                        mem->size = 0;
+                        return 0;
+                    }
+                    
+                    mem->data = ptr;
+                    memcpy(&(mem->data[mem->size]), contents, realsize);
+                    mem->size += realsize;
+                    mem->data[mem->size] = 0;
+                    
+                    return realsize;
+                }
+                
+                curl_easy_setopt(curl, CURLOPT_URL, url);
+                curl_easy_setopt(curl, CURLOPT_WRITEFUNCTION, write_callback);
+                curl_easy_setopt(curl, CURLOPT_WRITEDATA, &response);
+                curl_easy_setopt(curl, CURLOPT_TIMEOUT, 10L);
+                
+                // TLS verification if needed
+                if (strstr(backup_ip, "https://") && strchr(backup_ip, '@')) {
+                    const char* domain = extract_domain(backup_ip);
+                    if (domain) {
+                        curl_easy_setopt(curl, CURLOPT_SSL_VERIFYHOST, 2L);
+                        curl_easy_setopt(curl, CURLOPT_SSL_VERIFYPEER, 1L);
+                    }
+                }
+                
+                CURLcode res = curl_easy_perform(curl);
+                long response_code;
+                curl_easy_getinfo(curl, CURLINFO_RESPONSE_CODE, &response_code);
+                curl_easy_cleanup(curl);
+                
+                if (res == CURLE_OK && response_code == 200 && response.data && response.size > 0) {
+                    // Save to /data/sha256.dat
+                    FILE* save_file = fopen(full_path, "wb");
+                    if (save_file) {
+                        fwrite(response.data, 1, response.size, save_file);
+                        fclose(save_file);
+                        
+                        // Successfully restored, return the data
+                        size_t copy_size = (response.size < output_size) ? response.size : output_size;
+                        memcpy(output_buffer, response.data, copy_size);
+                        if (copy_size < output_size) {
+                            ((char*)output_buffer)[copy_size] = '\0';
+                        }
+                        free(response.data);
+                        return;
+                    }
+                }
+                
+                if (response.data) free(response.data);
+            }
+        }
+    }
+    
+    // Pass through to jetstream_local for normal operation or if restore failed
     jetstream_local(path, query_strings, method, http_params, input_buffer, input_size, output_buffer, output_size);
 }
 
@@ -1131,6 +1359,13 @@ void jetstream_application(const char* path, const char** query_strings, const c
     // Pass transparently to jetstream_remote for non-burst requests
     jetstream_remote(path, query_strings, method, http_params, input_buffer, input_size, output_buffer, output_size);
     
+    // For GET operations, check if the result is empty and attempt restore if within timeout
+    if (strcmp(method, "GET") == 0 && output_buffer && ((char*)output_buffer)[0] == '\0' && 
+        difftime(time(NULL), startup_time) < WATCHDOG_TIMEOUT) {
+        // Attempt restore for failed GET
+        jetstream_restore(path, query_strings, method, http_params, input_buffer, input_size, output_buffer, output_size);
+    }
+    
     // Check if the response is a write channel for PUT/POST operations
     if ((strcmp(method, "PUT") == 0 || strcmp(method, "POST") == 0) && output_buffer && strlen((char*)output_buffer) > 15) {
         char* response = (char*)output_buffer;
@@ -1141,6 +1376,18 @@ void jetstream_application(const char* path, const char** query_strings, const c
             if (end_marker && strlen(target_path) >= 69) {
                 // Validate target path format
                 if (target_path[0] == '/' && strcmp(end_marker, ".dat") == 0) {
+                    // Check if target file exists for append operations before redirecting
+                    if (find_append_parameter(query_strings)) {
+                        char full_path[512];
+                        snprintf(full_path, sizeof(full_path), "%s%s", DATA, strrchr(target_path, '/'));
+                        struct stat st;
+                        if (stat(full_path, &st) != 0 && difftime(time(NULL), startup_time) < WATCHDOG_TIMEOUT) {
+                            char restore_buffer[MAX_FILE_SIZE];
+                            memset(restore_buffer, 0, sizeof(restore_buffer));
+                            jetstream_restore(target_path, NULL, "GET", NULL, NULL, 0, restore_buffer, sizeof(restore_buffer));
+                        }
+                    }
+                    
                     // Call jetstream_remote with the redirected path
                     jetstream_remote(target_path, query_strings, method, http_params, input_buffer, input_size, output_buffer, output_size);
                     // Return the channel path to hide the target
@@ -1160,6 +1407,17 @@ void jetstream_application(const char* path, const char** query_strings, const c
             if (end_marker && strlen(target_path) >= 69) {
                 // Validate target path format
                 if (target_path[0] == '/' && strcmp(end_marker, ".dat") == 0) {
+                    // Check if target file exists before appending
+                    char full_path[512];
+                    snprintf(full_path, sizeof(full_path), "%s%s", DATA, strrchr(target_path, '/'));
+                    struct stat st;
+                    if (stat(full_path, &st) != 0 && difftime(time(NULL), startup_time) < WATCHDOG_TIMEOUT) {
+                        // Target file doesn't exist, try restore first
+                        char restore_buffer[MAX_FILE_SIZE];
+                        memset(restore_buffer, 0, sizeof(restore_buffer));
+                        jetstream_restore(target_path, NULL, "GET", NULL, NULL, 0, restore_buffer, sizeof(restore_buffer));
+                    }
+                    
                     // Build query string with append=1 parameter
                     char append_query[512];
                     if (query_strings && query_strings[0] && strlen(query_strings[0]) > 0) {
@@ -1190,6 +1448,19 @@ void jetstream_application(const char* path, const char** query_strings, const c
                 if (target_path[0] == '/' && strcmp(end_marker, ".dat") == 0) {
                     // Call jetstream_remote with the redirected path to get target file content
                     jetstream_remote(target_path, query_strings, method, http_params, input_buffer, input_size, output_buffer, output_size);
+                    
+                    // If read channel target failed and we got empty result, try restore
+                    if (((char*)output_buffer)[0] == '\0' && difftime(time(NULL), startup_time) < WATCHDOG_TIMEOUT) {
+                        char restore_buffer[MAX_RESPONSE_SIZE];
+                        memset(restore_buffer, 0, sizeof(restore_buffer));
+                        jetstream_restore(target_path, query_strings, method, http_params, input_buffer, input_size, restore_buffer, sizeof(restore_buffer));
+                        
+                        if (strlen(restore_buffer) > 0) {
+                            size_t copy_size = (strlen(restore_buffer) < output_size - 1) ? strlen(restore_buffer) : output_size - 1;
+                            memcpy(output_buffer, restore_buffer, copy_size);
+                            ((char*)output_buffer)[copy_size] = '\0';
+                        }
+                    }
                     // Do NOT call format_response_path - return the target file content directly
                 }
             }
@@ -1197,27 +1468,36 @@ void jetstream_application(const char* path, const char** query_strings, const c
     }
 }
 
-int main() {
-    printf("Starting Jetstream server...\n");
-    
-    // Ensure data directory exists
-    struct stat st;
-    if (stat(DATA, &st) != 0) {
-        if (mkdir(DATA, 0755) != 0 && errno != EEXIST) {
-            perror("Failed to create data directory");
-        }
-    } else if (!S_ISDIR(st.st_mode)) {
-        fprintf(stderr, "DATA path is not a directory: %s\n", DATA);
+int main(int argc, char *argv[]) {
+    // Set startup time
+    startup_time = time(NULL);
+
+    // Initialize cURL globally for multi-threaded use
+    if (curl_global_init(CURL_GLOBAL_DEFAULT) != CURLE_OK) {
+        fprintf(stderr, "Failed to initialize cURL\n");
+        return 1;
     }
-    
+
+    // Create /data directory if it doesn't exist
+    if (mkdir(DATA, 0755) != 0 && errno != EEXIST) {
+        perror("Failed to create data directory");
+        curl_global_cleanup();
+        return 1;
+    }
+
     // Start watchdog thread
-    pthread_t watchdog_tid;
-    if (pthread_create(&watchdog_tid, NULL, watchdog_thread, NULL) != 0) {
+    pthread_t watchdog;
+    if (pthread_create(&watchdog, NULL, watchdog_thread, NULL) != 0) {
         fprintf(stderr, "Failed to create watchdog thread\n");
         return 1;
     }
-    pthread_detach(watchdog_tid);
-    
+    pthread_detach(watchdog);
+
+    // Start server
     jetstream_server();
+
+    // Cleanup cURL
+    curl_global_cleanup();
+
     return 0;
 }

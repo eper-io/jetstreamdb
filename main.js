@@ -5,12 +5,59 @@ const http = require('http');
 const https = require('https');
 const url = require('url');
 const querystring = require('querystring');
+const { execSync } = require('child_process');
 
 // Constants
 const MAX_FILE_SIZE = 1024 * 1024; // 1 MB
 const WATCHDOG_INTERVAL = 60000; // 60 seconds
+const WATCHDOG_TIMEOUT = 60000; // 60 seconds for restore timeout
 const DATA_DIR = '/data';
-const CHUNK_SIZE = 4096;
+
+// Global startup time
+const startupTime = Date.now();
+
+// CHUNK_SIZE will be handled in next step
+// Global backup IP array
+const BACKUP_IPS = [
+    'http://18.209.57.108@hour.schmied.us'
+];
+
+// Helper: choose random backup IP
+function getRandomBackupIP() {
+    return BACKUP_IPS[Math.floor(Math.random() * BACKUP_IPS.length)];
+}
+
+// Helper: extract domain name from https://ip@name
+function extractDomain(url) {
+    const atIdx = url.indexOf('@');
+    return atIdx !== -1 ? url.substring(atIdx + 1) : null;
+}
+
+// jetstream_backup: PUT file to backup IP at /sha256.dat
+function jetstream_backup(filePath, sha256Name) {
+    const backupIP = getRandomBackupIP();
+    let urlStr = backupIP;
+    if (backupIP.includes('@')) {
+        urlStr = backupIP.split('@')[0];
+    }
+    urlStr += '/' + sha256Name;
+
+    const fileStream = fs.createReadStream(filePath);
+    const options = url.parse(urlStr);
+    options.method = 'PUT';
+    options.headers = { 'Content-Type': 'application/octet-stream' };
+
+    // TLS verification if needed
+    if (backupIP.startsWith('https://') && backupIP.includes('@')) {
+        options.servername = extractDomain(backupIP);
+    }
+
+    const req = (options.protocol === 'https:' ? https : http).request(options, (res) => {
+        // Optionally handle response
+    });
+    req.on('error', () => {});
+    fileStream.pipe(req);
+}
 
 // Ensure data directory exists
 if (!fs.existsSync(DATA_DIR)) {
@@ -52,15 +99,15 @@ function touchFile(filePath) {
 }
 
 // JetStream volatile function
-function jetstream_volatile(path, queryStrings, method, httpParams, inputBuffer, callback) {
+function jetstream_volatile(path, queryStrings, method, httpParams, inputBuffer) {
     // Validate path format: must be /sha256.dat
     if (!path.startsWith('/') || !path.endsWith('.dat') || path.length !== 69) {
-        return callback('');
+        return '';
     }
 
     const hash = path.substring(1, 65); // Extract hash part
     if (!/^[a-f0-9]{64}$/.test(hash)) {
-        return callback('');
+        return '';
     }
 
     const fullPath = pathModule.join(DATA_DIR, path.substring(1));
@@ -70,7 +117,7 @@ function jetstream_volatile(path, queryStrings, method, httpParams, inputBuffer,
         case 'POST':
             // Check input buffer size limit
             if (inputBuffer.length > MAX_FILE_SIZE) {
-                return callback('');
+                return '';
             }
 
             // Check for channel write: read existing file content first
@@ -84,10 +131,10 @@ function jetstream_volatile(path, queryStrings, method, httpParams, inputBuffer,
                     if (inputBuffer.toString().startsWith('Write channel /') &&
                         inputBuffer.toString() === existingContentStr) {
                         // Creating the same channel, return channel path
-                        return callback(formatResponsePath(path, queryStrings));
+                        return formatResponsePath(path, queryStrings);
                     } else {
                         // Writing to existing channel, return channel content for redirection
-                        return callback(existingContentStr);
+                        return existingContentStr;
                     }
                 }
                 
@@ -97,17 +144,17 @@ function jetstream_volatile(path, queryStrings, method, httpParams, inputBuffer,
                     if (inputBuffer.toString().startsWith('Append channel /') &&
                         inputBuffer.toString() === existingContentStr) {
                         // Creating the same channel, return channel path
-                        return callback(formatResponsePath(path, queryStrings));
+                        return formatResponsePath(path, queryStrings);
                     } else {
                         // Writing to existing channel, return channel content for redirection
-                        return callback(existingContentStr);
+                        return existingContentStr;
                     }
                 }
                 
                 // Check if existing content is a read channel
                 if (existingContentStr.startsWith('Read channel /')) {
                     // Read channels cannot be written to, return empty string
-                    return callback('');
+                    return '';
                 }
             } catch (err) {
                 // File doesn't exist, continue with normal operation
@@ -129,9 +176,9 @@ function jetstream_volatile(path, queryStrings, method, httpParams, inputBuffer,
                 touchFile(fullPath);
 
                 // Return the formatted path from request
-                return callback(formatResponsePath(path, queryStrings));
+                return formatResponsePath(path, queryStrings);
             } catch (err) {
-                return callback('');
+                return '';
             }
 
         case 'GET':
@@ -141,24 +188,24 @@ function jetstream_volatile(path, queryStrings, method, httpParams, inputBuffer,
                 
                 // Check file size to prevent memory exhaustion
                 if (content.length > MAX_FILE_SIZE) {
-                    return callback('');
+                    return '';
                 }
 
                 const contentStr = content.toString();
                 
                 // Check if content is a write channel, return empty string if so
                 if (contentStr.startsWith('Write channel /')) {
-                    return callback('');
+                    return '';
                 }
                 
                 // Check if content is an append channel, return empty string if so
                 if (contentStr.startsWith('Append channel /')) {
-                    return callback('');
+                    return '';
                 }
                 
                 // Check if content is a read channel, return channel content for redirection
                 if (contentStr.startsWith('Read channel /')) {
-                    return callback(contentStr);
+                    return contentStr;
                 }
 
                 // Check for take=1 query parameter
@@ -168,13 +215,13 @@ function jetstream_volatile(path, queryStrings, method, httpParams, inputBuffer,
                     // Take operation: read content then delete file atomically
                     // Check if content is a write channel, return empty string if so
                     if (contentStr.startsWith('Write channel /')) {
-                        return callback('');
+                        return '';
                     }
                     // Check if content is a read channel, return channel content for redirection
                     if (contentStr.startsWith('Read channel /')) {
                         // For read channels, return the channel content for redirection
                         // Don't delete the file in take mode for read channels
-                        return callback(contentStr);
+                        return contentStr;
                     }
                     // Update file modification time before deletion
                     touchFile(fullPath);
@@ -184,16 +231,16 @@ function jetstream_volatile(path, queryStrings, method, httpParams, inputBuffer,
                     } catch (deleteErr) {
                         // If deletion fails, still return the content we read
                     }
-                    return callback(content.toString());
+                    return content.toString();
                 } else {
                     // Normal GET operation: read file content without deletion
                     // Update file modification time after successful read
                     touchFile(fullPath);
-                    return callback(content.toString());
+                    return content.toString();
                 }
             } catch (err) {
                 // File doesn't exist - return empty string
-                return callback('');
+                return '';
             }
 
         case 'DELETE':
@@ -204,32 +251,32 @@ function jetstream_volatile(path, queryStrings, method, httpParams, inputBuffer,
                 
                 // Check if file is a write channel before deletion
                 if (contentStr.startsWith('Write channel /')) {
-                    return callback('');
+                    return '';
                 }
                 // Prevent deletion of append channels
                 if (contentStr.startsWith('Append channel /')) {
-                    return callback('');
+                    return '';
                 }
                 // Prevent deletion of read channels
                 if (contentStr.startsWith('Read channel /')) {
-                    return callback('');
+                    return '';
                 }
 
                 // Normal file - proceed with deletion
                 fs.unlinkSync(fullPath);
-                return callback(formatResponsePath(path, queryStrings));
+                return formatResponsePath(path, queryStrings);
             } catch (err) {
                 // File doesn't exist - return empty string
-                return callback('');
+                return '';
             }
 
         default:
-            return callback('');
+            return '';
     }
 }
 
 // JetStream nonvolatile function
-function jetstream_nonvolatile(path, queryStrings, method, httpParams, inputBuffer, callback) {
+function jetstream_nonvolatile(path, queryStrings, method, httpParams, inputBuffer) {
     switch (method) {
         case 'PUT':
         case 'POST':
@@ -239,12 +286,12 @@ function jetstream_nonvolatile(path, queryStrings, method, httpParams, inputBuff
             
             // If path is NULL, empty, or /, use content hash as path
             if (!path || path === '' || path === '/') {
-                return jetstream_volatile(expectedPath, queryStrings, method, httpParams, inputBuffer, callback);
+                return jetstream_volatile(expectedPath, queryStrings, method, httpParams, inputBuffer);
             }
             
             // If path matches content hash, store with this path
             if (path === expectedPath) {
-                return jetstream_volatile(path, queryStrings, method, httpParams, inputBuffer, callback);
+                return jetstream_volatile(path, queryStrings, method, httpParams, inputBuffer);
             }
             
             // Otherwise, read existing file and check hash
@@ -256,24 +303,24 @@ function jetstream_nonvolatile(path, queryStrings, method, httpParams, inputBuff
                 
                 // If existing content hash matches the path, ignore the PUT (content already stored)
                 if (path === existingExpectedPath) {
-                    return callback(formatResponsePath(path, queryStrings));
+                    return formatResponsePath(path, queryStrings);
                 }
             } catch (err) {
                 // File doesn't exist, continue with storage
             }
             
             // Store as key-value pair
-            return jetstream_volatile(path, queryStrings, method, httpParams, inputBuffer, callback);
+            return jetstream_volatile(path, queryStrings, method, httpParams, inputBuffer);
             
         case 'GET':
         case 'HEAD':
             // Forward GET and HEAD requests directly
-            return jetstream_volatile(path, queryStrings, method, httpParams, inputBuffer, callback);
+            return jetstream_volatile(path, queryStrings, method, httpParams, inputBuffer);
             
         case 'DELETE':
             // For DELETE, check if file exists and hash matches path (matching main.c)
             if (!path || path.length !== 69 || !path.startsWith('/') || !path.endsWith('.dat')) {
-                return jetstream_volatile(path, queryStrings, method, httpParams, inputBuffer, callback);
+                return jetstream_volatile(path, queryStrings, method, httpParams, inputBuffer);
             }
             
             const deleteFullPath = pathModule.join(DATA_DIR, path.substring(1));
@@ -284,196 +331,251 @@ function jetstream_nonvolatile(path, queryStrings, method, httpParams, inputBuff
                 
                 // If existing content hash matches the path, ignore the DELETE
                 if (path === existingExpectedPath) {
-                    return callback('');
+                    return '';
                 }
             } catch (err) {
                 // File doesn't exist, continue with deletion
             }
             
             // Hash doesn't match or file doesn't exist, proceed with delete
-            return jetstream_volatile(path, queryStrings, method, httpParams, inputBuffer, callback);
+            return jetstream_volatile(path, queryStrings, method, httpParams, inputBuffer);
             
         default:
-            return callback('');
+            return '';
     }
 }
 
 // JetStream local function
-function jetstream_local(path, queryStrings, method, httpParams, inputBuffer, callback) {
+function jetstream_local(path, queryStrings, method, httpParams, inputBuffer) {
     // Pass transparently to jetstream_nonvolatile (matching main.c)
-    jetstream_nonvolatile(path, queryStrings, method, httpParams, inputBuffer, callback);
+    return jetstream_nonvolatile(path, queryStrings, method, httpParams, inputBuffer);
 }
 
 // JetStream restore function
-function jetstream_restore(path, queryStrings, method, httpParams, inputBuffer, callback) {
-    // Pass through to jetstream_local
-    jetstream_local(path, queryStrings, method, httpParams, inputBuffer, callback);
+function jetstream_restore(path, queryStrings, method, httpParams, inputBuffer) {
+    // For GET requests to /sha256.dat files, try to fetch from backup IPs if file is missing
+    if (method === 'GET' && path.startsWith('/') && path.endsWith('.dat')) {
+        // First check if file exists locally
+        const fullPath = pathModule.join(DATA_DIR, pathModule.basename(path));
+        if (fs.existsSync(fullPath)) {
+            // File exists locally, use jetstream_local
+            return jetstream_local(path, queryStrings, method, httpParams, inputBuffer);
+        }
+        
+        // File doesn't exist locally, try to restore from backup if within timeout
+        if (Date.now() - startupTime < WATCHDOG_TIMEOUT) {
+            // Try each backup IP randomly
+            const indices = BACKUP_IPS.map((_, i) => i).sort(() => Math.random() - 0.5);
+            
+            for (const idx of indices) {
+                const backupIP = BACKUP_IPS[idx];
+                let urlStr = backupIP;
+                if (backupIP.includes('@')) {
+                    urlStr = backupIP.split('@')[0];
+                }
+                urlStr += path;
+                
+                try {
+                    // Use child_process.execSync to make synchronous HTTP request
+                    let curlCommand = `curl -s --connect-timeout 10 --max-time 10 "${urlStr}"`;
+                    
+                    // TLS verification if needed
+                    if (backupIP.startsWith('https://') && backupIP.includes('@')) {
+                        const domain = extractDomain(backupIP);
+                        if (domain) {
+                            curlCommand += ` --resolve "${domain}:443:${urlStr.split('://')[1].split('/')[0].split('@')[0]}"`;
+                        }
+                    }
+                    
+                    const data = execSync(curlCommand, { maxBuffer: MAX_FILE_SIZE });
+                    
+                    if (data && data.length > 0) {
+                        // Save to /data/sha256.dat
+                        const shaFile = pathModule.join(DATA_DIR, pathModule.basename(path));
+                        try {
+                            fs.writeFileSync(shaFile, data);
+                            // Successfully restored, return the data
+                            return data;
+                        } catch (err) {
+                            continue;
+                        }
+                    }
+                } catch (err) {
+                    // Continue to next backup IP
+                    continue;
+                }
+            }
+        }
+    }
+    
+    // Pass through to jetstream_local for normal operation or if restore failed
+    return jetstream_local(path, queryStrings, method, httpParams, inputBuffer);
 }
 
 // JetStream remote function
-function jetstream_remote(path, queryStrings, method, httpParams, inputBuffer, callback) {
+function jetstream_remote(path, queryStrings, method, httpParams, inputBuffer) {
     // Pass through to jetstream_restore
-    jetstream_restore(path, queryStrings, method, httpParams, inputBuffer, callback);
+    return jetstream_restore(path, queryStrings, method, httpParams, inputBuffer);
 }
 
 // JetStream application function
-function jetstream_application(path, queryStrings, method, httpParams, inputBuffer, callback) {
+// JetStream application function
+function jetstream_application(path, queryStrings, method, httpParams, inputBuffer) {
     // Check for burst parameter
     if (queryStrings.includes('burst=1')) {
         if (method === 'GET') {
             // Burst GET: call jetstream_remote to get list of chunk hashes
-            return jetstream_remote(path, queryStrings, method, httpParams, inputBuffer, (listResult) => {
-                if (!listResult) {
-                    return callback('');
-                }
-                
-                // Parse newline-separated list of /sha256.dat values
-                const hashList = listResult.split('\n').filter(hash => hash.trim());
-                const contentChunks = [];
-                
-                // Limit number of hash entries to prevent memory exhaustion
-                const maxHashes = Math.min(hashList.length, 1000);
-                
-                if (maxHashes === 0) {
-                    return callback('');
-                }
-                
-                // Process each hash iteratively to avoid stack overflow
-                let currentIndex = 0;
-                
-                function processNextChunk() {
-                    if (currentIndex >= maxHashes) {
-                        // Join all chunks at once to avoid repeated string concatenation
-                        const concatenatedContent = contentChunks.join('');
-                        return callback(concatenatedContent);
-                    }
-                    
-                    const hashPath = hashList[currentIndex].trim();
-                    currentIndex++;
-                    
-                    if (hashPath.startsWith('/') && hashPath.endsWith('.dat') && hashPath.length === 69) {
-                        jetstream_remote(hashPath, [], 'GET', [], Buffer.alloc(0), (chunkContent) => {
-                            if (chunkContent) {
-                                contentChunks.push(chunkContent);
-                            }
-                            // Use setImmediate to prevent stack overflow on large datasets
-                            setImmediate(processNextChunk);
-                        });
-                    } else {
-                        // Use setImmediate to prevent stack overflow
-                        setImmediate(processNextChunk);
+            const listResult = jetstream_remote(path, queryStrings, method, httpParams, inputBuffer);
+            if (!listResult) {
+                return '';
+            }
+            
+            // Parse newline-separated list of /sha256.dat values
+            const hashList = listResult.split('\n').filter(hash => hash.trim());
+            const contentChunks = [];
+            
+            // Limit number of hash entries to prevent memory exhaustion
+            const maxHashes = Math.min(hashList.length, 1000);
+            
+            if (maxHashes === 0) {
+                return '';
+            }
+            
+            // Process each hash synchronously
+            for (let i = 0; i < maxHashes; i++) {
+                const hashPath = hashList[i].trim();
+                if (hashPath.startsWith('/') && hashPath.endsWith('.dat') && hashPath.length === 69) {
+                    const chunkContent = jetstream_remote(hashPath, [], 'GET', [], Buffer.alloc(0));
+                    if (chunkContent) {
+                        contentChunks.push(chunkContent);
                     }
                 }
-                
-                processNextChunk();
-            });
+            }
+            
+            // Join all chunks
+            return contentChunks.join('');
         }
         
         if (method === 'PUT' || method === 'POST') {
-            // Burst PUT/POST: split input into 4KB chunks and store each (matching main.c)
-            const inputPtr = inputBuffer;
-            let remainingInput = inputBuffer.length;
+            // Burst PUT/POST: split input into 4KB chunks and store each
             const sha256List = [];
+            const CHUNK_SIZE = 4096;
             
-            // Process input in 4096-byte blocks iteratively to avoid stack overflow
-            let currentOffset = 0;
-            
-            function processNextBlock() {
-                if (currentOffset >= inputBuffer.length) {
-                    // All blocks processed, store the collected SHA256 list
-                    const hashList = sha256List.join('\n');
-                    const hashListBuffer = Buffer.from(hashList);
-                    return jetstream_remote(path, queryStrings, method, httpParams, hashListBuffer, callback);
-                }
-                
-                const blockSize = Math.min(CHUNK_SIZE, inputBuffer.length - currentOffset);
-                const block = inputBuffer.slice(currentOffset, currentOffset + blockSize);
-                currentOffset += blockSize;
+            // Process input in 4096-byte blocks
+            for (let offset = 0; offset < inputBuffer.length; offset += CHUNK_SIZE) {
+                const blockSize = Math.min(CHUNK_SIZE, inputBuffer.length - offset);
+                const block = inputBuffer.slice(offset, offset + blockSize);
                 
                 // Store this block via jetstream_remote (use null path like main.c)
-                jetstream_remote(null, null, method, httpParams, block, (blockResponse) => {
-                    // Add SHA256 path to list if valid
-                    if (blockResponse && blockResponse.length > 0) {
-                        sha256List.push(blockResponse);
-                    }
-                    
-                    // Use setImmediate to prevent stack overflow on large files
-                    setImmediate(processNextBlock);
-                });
+                const blockResponse = jetstream_remote(null, [], method, httpParams, block);
+                
+                // Add SHA256 path to list if valid
+                if (blockResponse && blockResponse.length > 0) {
+                    sha256List.push(blockResponse);
+                }
             }
             
-            processNextBlock();
-            return;
+            // All blocks processed, store the collected SHA256 list
+            const hashList = sha256List.join('\n');
+            const hashListBuffer = Buffer.from(hashList);
+            return jetstream_remote(path, queryStrings.filter(q => q !== 'burst=1'), method, httpParams, hashListBuffer);
         }
     }
     
-    // Pass transparently to jetstream_remote for non-burst requests (matching main.c)
-    jetstream_remote(path, queryStrings, method, httpParams, inputBuffer, (response) => {
-        // Check if the response is a write channel for PUT/POST operations (matching main.c)
-        if ((method === 'PUT' || method === 'POST') && response && response.length > 15) {
-            if (response.startsWith('Write channel /')) {
-                // Extract the target path from "Write channel /sha256.dat"
-                const targetPath = response.substring(14); // Skip "Write channel "
-                const endMarker = targetPath.indexOf('.dat');
-                if (endMarker !== -1 && targetPath.length >= 69) {
-                    // Validate target path format
-                    if (targetPath.startsWith('/') && targetPath.substring(endMarker) === '.dat') {
-                        // Call jetstream_remote with the redirected path
-                        return jetstream_remote(targetPath, queryStrings, method, httpParams, inputBuffer, (targetResponse) => {
-                            // Return the channel path to hide the target (format response path)
-                            callback(formatResponsePath(path, queryStrings));
-                        });
-                    }
-                }
-            }
+    // Pass transparently to jetstream_remote for non-burst requests
+    let response = jetstream_remote(path, queryStrings, method, httpParams, inputBuffer);
+    
+    // For GET operations, check if the result is empty and attempt restore if within timeout
+    if (method === 'GET' && (!response || response.length === 0) && Date.now() - startupTime < WATCHDOG_TIMEOUT) {
+        // Attempt restore for failed GET
+        const restoreResult = jetstream_restore(path, queryStrings, method, httpParams, inputBuffer);
+        if (restoreResult && restoreResult.length > 0) {
+            response = restoreResult;
         }
-        
-        // Check if the response is an append channel for PUT/POST operations (matching main.c)
-        if ((method === 'PUT' || method === 'POST') && response && response.length > 16) {
-            if (response.startsWith('Append channel /')) {
-                // Extract the target path from "Append channel /sha256.dat"
-                const targetPath = response.substring(15); // Skip "Append channel "
-                const endMarker = targetPath.indexOf('.dat');
-                if (endMarker !== -1 && targetPath.length >= 69) {
-                    // Validate target path format
-                    if (targetPath.startsWith('/') && targetPath.substring(endMarker) === '.dat') {
-                        // Build query string with append=1 parameter
-                        let appendQuery = 'append=1';
-                        if (queryStrings && queryStrings.length > 0 && queryStrings[0].length > 0) {
-                            appendQuery = queryStrings[0] + '&append=1';
+    }
+    
+    // Check if the response is a write channel for PUT/POST operations
+    if ((method === 'PUT' || method === 'POST') && response && response.length > 15) {
+        if (response.startsWith('Write channel /')) {
+            // Extract the target path from "Write channel /sha256.dat"
+            const targetPath = response.substring(14); // Skip "Write channel "
+            const endMarker = targetPath.indexOf('.dat');
+            if (endMarker !== -1 && targetPath.length >= 69) {
+                // Validate target path format
+                if (targetPath.startsWith('/') && targetPath.substring(endMarker) === '.dat') {
+                    // Check if target file exists for append operations before redirecting
+                    if (queryStrings.some(q => q.includes('append=1'))) {
+                        const fullPath = pathModule.join(DATA_DIR, pathModule.basename(targetPath));
+                        if (!fs.existsSync(fullPath) && Date.now() - startupTime < WATCHDOG_TIMEOUT) {
+                            // Target file doesn't exist, try restore first
+                            jetstream_restore(targetPath, [], 'GET', [], Buffer.alloc(0));
                         }
-                        // Create query string array for jetstream_remote
-                        const appendQueryArray = [appendQuery];
-                        // Call jetstream_remote with the redirected path and append=1
-                        return jetstream_remote(targetPath, appendQueryArray, method, httpParams, inputBuffer, (targetResponse) => {
-                            // Return the channel path to hide the target
-                            callback(formatResponsePath(path, queryStrings));
-                        });
                     }
+                    
+                    // Call jetstream_remote with the redirected path
+                    jetstream_remote(targetPath, queryStrings, method, httpParams, inputBuffer);
+                    // Return the channel path to hide the target
+                    return formatResponsePath(path, queryStrings);
                 }
             }
         }
-        
-        // Check if the response is a read channel for GET operations (matching main.c)
-        if (method === 'GET' && response && response.length > 14) {
-            if (response.startsWith('Read channel /')) {
-                // Extract the target path from "Read channel /sha256.dat"
-                const targetPath = response.substring(13); // Skip "Read channel "
-                const endMarker = targetPath.indexOf('.dat');
-                if (endMarker !== -1 && targetPath.length >= 69) {
-                    // Validate target path format
-                    if (targetPath.startsWith('/') && targetPath.substring(endMarker) === '.dat') {
-                        // Call jetstream_remote with the redirected path to get target file content
-                        return jetstream_remote(targetPath, queryStrings, method, httpParams, inputBuffer, callback);
-                        // Do NOT call formatResponsePath - return the target file content directly
+    }
+    
+    // Check if the response is an append channel for PUT/POST operations
+    if ((method === 'PUT' || method === 'POST') && response && response.length > 16) {
+        if (response.startsWith('Append channel /')) {
+            // Extract the target path from "Append channel /sha256.dat"
+            const targetPath = response.substring(15); // Skip "Append channel "
+            const endMarker = targetPath.indexOf('.dat');
+            if (endMarker !== -1 && targetPath.length >= 69) {
+                // Validate target path format
+                if (targetPath.startsWith('/') && targetPath.substring(endMarker) === '.dat') {
+                    // Check if target file exists before appending
+                    const fullPath = pathModule.join(DATA_DIR, pathModule.basename(targetPath));
+                    if (!fs.existsSync(fullPath) && Date.now() - startupTime < WATCHDOG_TIMEOUT) {
+                        // Target file doesn't exist, try restore first
+                        jetstream_restore(targetPath, [], 'GET', [], Buffer.alloc(0));
                     }
+                    
+                    // Add append=1 to query strings
+                    const appendQueryStrings = [...queryStrings, 'append=1'];
+                    
+                    // Call jetstream_remote with the redirected path and append=1
+                    jetstream_remote(targetPath, appendQueryStrings, method, httpParams, inputBuffer);
+                    // Return the channel path to hide the target
+                    return formatResponsePath(path, queryStrings);
                 }
             }
         }
-        
-        // Return the original response
-        callback(response);
-    });
+    }
+    
+    // Check if the response is a read channel for GET operations
+    if (method === 'GET' && response && response.length > 14) {
+        if (response.startsWith('Read channel /')) {
+            // Extract the target path from "Read channel /sha256.dat"
+            const targetPath = response.substring(13); // Skip "Read channel "
+            const endMarker = targetPath.indexOf('.dat');
+            if (endMarker !== -1 && targetPath.length >= 69) {
+                // Validate target path format
+                if (targetPath.startsWith('/') && targetPath.substring(endMarker) === '.dat') {
+                    // Call jetstream_remote with the redirected path to get target file content
+                    let channelResult = jetstream_remote(targetPath, queryStrings, method, httpParams, inputBuffer);
+                    
+                    // If read channel target failed and we got empty result, try restore
+                    if ((!channelResult || channelResult.length === 0) && Date.now() - startupTime < WATCHDOG_TIMEOUT) {
+                        const restoreResult = jetstream_restore(targetPath, queryStrings, method, httpParams, inputBuffer);
+                        if (restoreResult) {
+                            channelResult = restoreResult;
+                        }
+                    }
+                    return channelResult;
+                }
+            }
+        }
+    }
+    
+    // Return the original response
+    return response;
 }
 
 // HTTP request handler
@@ -481,6 +583,7 @@ function httpHandler(req, res) {
     let body = Buffer.alloc(0);
     
     req.on('data', (chunk) => {
+        // Only enforce MAX_FILE_SIZE for uploads
         if (body.length + chunk.length > MAX_FILE_SIZE) {
             res.writeHead(413, { 'Content-Type': 'text/plain' });
             res.end('Request entity too large');
@@ -513,19 +616,18 @@ function httpHandler(req, res) {
             httpParams.push(`${key}: ${value}`);
         }
         
-        // Call jetstream_application
-        jetstream_application(path, queryStrings, method, httpParams, body, (result) => {
-            if (result === null || result === undefined) {
-                result = '';
-            }
-            
-            res.writeHead(200, {
-                'Content-Type': 'text/plain',
-                'Content-Length': Buffer.byteLength(result),
-                'Connection': 'close'
-            });
-            res.end(result);
+        // Call jetstream_application (now synchronous)
+        let result = jetstream_application(path, queryStrings, method, httpParams, body);
+        if (result === null || result === undefined) {
+            result = '';
+        }
+        
+        res.writeHead(200, {
+            'Content-Type': 'text/plain',
+            'Content-Length': Buffer.byteLength(result),
+            'Connection': 'close'
         });
+        res.end(result);
     });
     
     req.on('error', (err) => {
@@ -550,6 +652,12 @@ function watchdog() {
                 if (ageMs > WATCHDOG_INTERVAL) {
                     fs.unlinkSync(filePath);
                     console.log(`Watchdog cleaned up: ${file}`);
+                } else {
+                    // Not deleted, backup
+                    if (file.endsWith('.dat') && file.length === 68) {
+                        const sha256Name = file;
+                        jetstream_backup(filePath, sha256Name);
+                    }
                 }
             } catch (err) {
                 // Ignore errors for individual files
@@ -577,6 +685,9 @@ function jetstream_server() {
         };
         
         const httpsServer = https.createServer(options, httpHandler);
+        httpsServer.on('connection', (socket) => {
+            socket.setTimeout(10000); // 10 second socket timeout
+        });
         httpsServer.listen(443, () => {
             console.log('JetStreamDB HTTPS server listening on port 443');
         });
@@ -594,6 +705,9 @@ function jetstream_server() {
 
 function startHttpServer() {
     const httpServer = http.createServer(httpHandler);
+    httpServer.on('connection', (socket) => {
+        socket.setTimeout(10000); // 10 second socket timeout
+    });
     httpServer.listen(7777, () => {
         console.log('JetStreamDB HTTP server listening on port 7777');
     });

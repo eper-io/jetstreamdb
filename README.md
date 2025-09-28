@@ -837,6 +837,48 @@ The system must not replicate data across nodes at the same level to maintain co
 
 These changes ensure that data is served efficiently from the distributed network while strictly avoiding local caching of peer data to maintain consistency. The code has been updated.
 
+## Call Flow Diagram
+
+```
+HTTP Request
+     ↓
+jetstream_application()
+     ↓
+jetstream_remote()
+     ↓
+jetstream_restore()
+     ↓
+jetstream_local()
+     ↓
+    ┌─────────────────────┐
+    ↓                     ↓
+jetstream_nonvolatile()   jetstream_volatile()
+    ↓                     ↓
+jetstream_volatile()   [File System I/O]
+    ↓
+[File System I/O]
+```
+
+## Hardware Implementations (Secure PCIE)
+
+This logic can also be used to be applied in hardware as a key-value architecture for DRAM, NVRAM, SSD, and GPU solutions.
+
+Traditionally memory is addressed with blocks with increasing addresses. Virtual memory and file systems added some shuffle but with a fixed address space.
+
+Memory layout randomization helped to catch and prevent the spread of malware.
+
+Our approach of completely random 32 byte or 64 byte addresses help to mitigate the problem of sharing expensive DRAM and GPU DDRAM blocks.
+
+Processes can address memory blocks with a key of a random number that is known to the process only.
+
+Public shared blocks like DLLs, libraries, media can use a SHA256 hash of their value to reduce memory size.
+
+Common blocks that are not propagated can be chained together like scatter-gather DMA requests saving memory for the individual SHA256 addressed blocks keeping the integrity and privacy of chains with some but not all private blocks.
+
+Hardware support for key-value stores is still limited to the most advanced SSD models. This means that our implementation can be a good software simulation.
+
+A good process, agent, or script can be a chain of segments fetched from the system by the hardware upon startup. Isolated processes can just use these addresses, if the address length is long enough. Padding with fix based addresses can still eliminate very rare collisions for very high reliability systems like nuclear facilities, aerospace, life support devices. Addressing can use a pattern of `[base+secret+offset, size]` with base being an allocated block, secret virtually identifying an isolated address, and offset pointing to the part used.
+
 ## ACID
 
 Our approach to ACID principles is pragmatic economics. We insist on features occurring less than 1% not to degrade the performance of features occurring more than 50%. Our implementation requires that data keys need to be created in advance to satisfy ACID requirements.
