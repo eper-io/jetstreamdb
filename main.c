@@ -15,6 +15,8 @@
 #include <dirent.h>
 #include <time.h>
 #include <utime.h>
+#include <signal.h>
+#include <stdatomic.h>
 
 /*
 gcc -o main main.c -lpthread -lssl -lcrypto -lcurl -ljansson -Wl,-z,noexecstack && ./main
@@ -35,6 +37,9 @@ static time_t startup_time;
 static int active_connections = 0;
 static pthread_mutex_t connection_mutex = PTHREAD_MUTEX_INITIALIZER;
 
+// RNG mutex for thread-safe rand()
+static pthread_mutex_t rng_mutex = PTHREAD_MUTEX_INITIALIZER;
+
 // Node configuration (2D array of nodes)
 // Global backup IP array
 static const char* BACKUP_IPS[] = {
@@ -42,10 +47,69 @@ static const char* BACKUP_IPS[] = {
 };
 static const int NUM_BACKUP_IPS = sizeof(BACKUP_IPS) / sizeof(BACKUP_IPS[0]);
 
+static volatile sig_atomic_t stop_flag = 0; // Graceful shutdown flag
+static int server_listen_socket = -1;       // Global listen socket for signal handler
+
+// Central SHA256 path validator
+static int is_valid_sha256_path(const char* path) {
+    if (!path) return 0;
+    if (strlen(path) != 69 || path[0] != '/' || strcmp(path + 65, ".dat") != 0) return 0;
+    for (int i = 1; i <= 64; i++) {
+        char c = path[i];
+        if (!((c >= '0' && c <= '9') || (c >= 'a' && c <= 'f') || (c >= 'A' && c <= 'F'))) return 0;
+    }
+    return 1;
+}
+
+// Thread-safe random helper
+static int safe_rand_range(int max_exclusive) {
+    int r;
+    pthread_mutex_lock(&rng_mutex);
+    r = rand();
+    pthread_mutex_unlock(&rng_mutex);
+    if (max_exclusive <= 0) return 0;
+    return r % max_exclusive;
+}
+
+// Graceful shutdown signal handler
+static void handle_termination_signal(int sig) {
+    (void)sig;
+    stop_flag = 1;
+    // Close server socket atomically - signal handlers must only call async-signal-safe functions
+    int sock = server_listen_socket;
+    if (sock >= 0) {
+        server_listen_socket = -1;  // Mark as closed first
+        close(sock);  // Then close - this is async-signal-safe
+    }
+}
+
+// cURL write callback (moved out of jetstream_restore)
+struct curl_response { char* data; size_t size; };
+static size_t curl_write_cb(void* contents, size_t size, size_t nmemb, void* userp) {
+    size_t realsize = size * nmemb;
+    struct curl_response* mem = (struct curl_response*)userp;
+    
+    // Prevent excessive memory allocation
+    if (mem->size + realsize > MAX_FILE_SIZE) {
+        return 0;  // Signal cURL to abort
+    }
+    
+    void* ptr = realloc(mem->data, mem->size + realsize + 1);
+    if (!ptr) {
+        // Don't free existing data on realloc failure - let caller handle cleanup
+        return 0;  // Signal cURL to abort
+    }
+    mem->data = ptr;
+    memcpy(mem->data + mem->size, contents, realsize);
+    mem->size += realsize;
+    mem->data[mem->size] = '\0';
+    return realsize;
+}
+
 // Helper: choose random backup IP
 const char* get_random_backup_ip() {
-    srand((unsigned int)time(NULL) ^ getpid());
-    int idx = rand() % NUM_BACKUP_IPS;
+    // Thread-safe random index without reseeding each call
+    int idx = safe_rand_range(NUM_BACKUP_IPS);
     return BACKUP_IPS[idx];
 }
 
@@ -57,20 +121,21 @@ const char* extract_domain(const char* url) {
 
 #include <curl/curl.h>
 
-// Structure for cURL response data
-struct curl_response {
-    char* data;
-    size_t size;
-};
-
 // Backup function: PUT file to backup IP at /sha256.dat
 void jetstream_backup(const char* file_path, const char* sha256_name) {
     const char* backup_ip = get_random_backup_ip();
     char url[512];
     if (strchr(backup_ip, '@')) {
         char ip_part[256];
-        strncpy(ip_part, backup_ip, strchr(backup_ip, '@') - backup_ip);
-        ip_part[strchr(backup_ip, '@') - backup_ip] = '\0';
+        const char* at_pos = strchr(backup_ip, '@');
+        size_t ip_len = at_pos - backup_ip;
+        
+        if (ip_len >= sizeof(ip_part)) {
+            return;  // IP part too long, abort
+        }
+        
+        strncpy(ip_part, backup_ip, ip_len);
+        ip_part[ip_len] = '\0';
         snprintf(url, sizeof(url), "%s/%s", ip_part, sha256_name);
     } else {
         snprintf(url, sizeof(url), "%s/%s", backup_ip, sha256_name);
@@ -78,12 +143,34 @@ void jetstream_backup(const char* file_path, const char* sha256_name) {
 
     FILE* f = fopen(file_path, "rb");
     if (!f) return;
-    fseek(f, 0, SEEK_END);
+    
+    if (fseek(f, 0, SEEK_END) != 0) {
+        fclose(f);
+        return;
+    }
+    
     long size = ftell(f);
-    fseek(f, 0, SEEK_SET);
+    if (size < 0 || size > MAX_FILE_SIZE) {
+        fclose(f);
+        return;
+    }
+    
+    if (fseek(f, 0, SEEK_SET) != 0) {
+        fclose(f);
+        return;
+    }
+    
     char* buf = malloc(size);
-    if (!buf) { fclose(f); return; }
-    fread(buf, 1, size, f);
+    if (!buf) { 
+        fclose(f); 
+        return; 
+    }
+    
+    if (fread(buf, 1, size, f) != (size_t)size) {
+        free(buf);
+        fclose(f);
+        return;
+    }
     fclose(f);
 
     CURL* curl = curl_easy_init();
@@ -273,10 +360,19 @@ int parse_http_request(const char* request, http_request_t* parsed) {
             parsed->body_length = MAX_FILE_SIZE;
         }
         parsed->body = malloc(parsed->body_length + 1);
-        if (parsed->body) {
-            memcpy(parsed->body, body_start, parsed->body_length);
-            parsed->body[parsed->body_length] = '\0';
+        if (!parsed->body) {
+            // Clean up on malloc failure
+            if (parsed->query_strings) {
+                for (int i = 0; parsed->query_strings[i]; i++) {
+                    free(parsed->query_strings[i]);
+                }
+                free(parsed->query_strings);
+            }
+            free(request_copy);
+            return -1;
         }
+        memcpy(parsed->body, body_start, parsed->body_length);
+        parsed->body[parsed->body_length] = '\0';
     } else {
         parsed->body = NULL;
         parsed->body_length = 0;
@@ -306,80 +402,134 @@ void free_http_request(http_request_t* req) {
 // Handle client connection
 void* handle_client(void* arg) {
     client_connection_t* client = (client_connection_t*)arg;
-    // Set socket receive timeout (10 seconds)
-    struct timeval timeout;
-    timeout.tv_sec = 10;
-    timeout.tv_usec = 0;
+    struct timeval timeout; timeout.tv_sec = 10; timeout.tv_usec = 0;
     setsockopt(client->socket, SOL_SOCKET, SO_RCVTIMEO, (const char*)&timeout, sizeof(timeout));
-    char buffer[MAX_REQUEST_SIZE];
-    char response[MAX_RESPONSE_SIZE];
-    int bytes_read;
-    
-    // Read HTTP request
-    if (client->ssl) {
-        bytes_read = SSL_read(client->ssl, buffer, sizeof(buffer) - 1);
-    } else {
-        bytes_read = recv(client->socket, buffer, sizeof(buffer) - 1, 0);
+    char* response = (char*)malloc(MAX_RESPONSE_SIZE); if (!response) goto cleanup;
+    char* header_buffer = (char*)malloc(MAX_REQUEST_SIZE); if (!header_buffer) { free(response); goto cleanup; }
+    int total_read = 0; int header_complete = 0; int header_len = 0;
+    while (total_read < MAX_REQUEST_SIZE - 1) {
+        int chunk = client->ssl ? SSL_read(client->ssl, header_buffer + total_read, MAX_REQUEST_SIZE - 1 - total_read) : recv(client->socket, header_buffer + total_read, MAX_REQUEST_SIZE - 1 - total_read, 0);
+        if (chunk <= 0) goto cleanup_free_buffers;
+        total_read += chunk; header_buffer[total_read] = '\0';
+        char* hdr_end = strstr(header_buffer, "\r\n\r\n");
+        if (hdr_end) { header_complete = 1; header_len = (int)(hdr_end - header_buffer) + 4; break; }
     }
-    
-    if (bytes_read <= 0) {
-        goto cleanup;
-    }
-    
-    buffer[bytes_read] = '\0';
-    
-    // Parse HTTP request
-    http_request_t request;
-    memset(&request, 0, sizeof(request));
-    
-    if (parse_http_request(buffer, &request) != 0) {
-        const char* error_response = "HTTP/1.1 200 OK\r\nContent-Length: 0\r\n\r\n";
-        if (client->ssl) {
-            SSL_write(client->ssl, error_response, strlen(error_response));
-        } else {
-            send(client->socket, error_response, strlen(error_response), 0);
+    if (!header_complete) goto cleanup_free_buffers;
+    // Parse Content-Length (case-insensitive search)
+    size_t content_length = 0;
+    char* p = header_buffer;
+    while (*p) {
+        // Look for "Content-Length:" case-insensitively
+        if (strncasecmp(p, "Content-Length:", 15) == 0) {
+            char* line_end = strstr(p, "\r\n"); 
+            if (!line_end) break;
+            char* num_start = p + 15; // Length of "Content-Length:"
+            while (*num_start == ' ' || *num_start == '\t') num_start++;
+            content_length = (size_t)strtoull(num_start, NULL, 10);
+            break;
         }
-        free_http_request(&request);
-        goto cleanup;
+        p++;
     }
-    
-    // Prepare output buffer for jetstream_application
-    char output_buffer[MAX_RESPONSE_SIZE];
-    memset(output_buffer, 0, sizeof(output_buffer));
-    
-    // Call jetstream_application
+    if (content_length > MAX_FILE_SIZE) content_length = MAX_FILE_SIZE; // Clamp
+    size_t already_body = (size_t)(total_read - header_len);
+    if (already_body > content_length) already_body = content_length; // Over-read safeguard
+    char* body_buffer = NULL;
+    if (content_length > 0) {
+        body_buffer = (char*)malloc(content_length + 1);
+        if (!body_buffer) goto cleanup_free_buffers;
+        if (already_body > 0) memcpy(body_buffer, header_buffer + header_len, already_body);
+        size_t remaining = content_length - already_body;
+        while (remaining > 0) {
+            int chunk = client->ssl ? SSL_read(client->ssl, body_buffer + (content_length - remaining), (int)remaining)
+                                    : recv(client->socket, body_buffer + (content_length - remaining), remaining, 0);
+            if (chunk <= 0) { content_length -= remaining; break; }
+            remaining -= (size_t)chunk;
+        }
+        body_buffer[content_length] = '\0';
+    }
+    // Extract request line
+    char* first_line_end = strstr(header_buffer, "\r\n");
+    if (!first_line_end) goto cleanup_body;
+    *first_line_end = '\0';
+    char method[16] = {0}; char url_path[256] = {0};
+    sscanf(header_buffer, "%15s %255s", method, url_path);
+    // Split query
+    char* query_part = strchr(url_path, '?');
+    char* query_dup = NULL; char** query_array = NULL;
+    if (query_part) {
+        *query_part = '\0'; query_part++;
+        query_dup = strdup(query_part);
+        if (query_dup) {
+            // Count
+            int count = 1; for (char* t = query_dup; *t; t++) if (*t == '&') count++;
+            query_array = (char**)malloc((count + 1) * sizeof(char*));
+            if (query_array) {
+                int idx = 0; char* token = strtok(query_dup, "&");
+                while (token && idx < count) { query_array[idx++] = strdup(token); token = strtok(NULL, "&"); }
+                query_array[idx] = NULL;
+            }
+        }
+    }
+    http_request_t request; memset(&request, 0, sizeof(request));
+    strncpy(request.method, method, sizeof(request.method) - 1);
+    strncpy(request.path, url_path, sizeof(request.path) - 1);
+    request.query_strings = query_array;
+    request.body = body_buffer; request.body_length = content_length;
+    // Allocate output buffer
+    char* output_buffer = (char*)malloc(MAX_RESPONSE_SIZE);
+    if (!output_buffer) goto cleanup_request;
+    memset(output_buffer, 0, MAX_RESPONSE_SIZE);
     jetstream_application(request.path, (const char**)request.query_strings, request.method,
-                         (const char**)request.http_params, request.body, request.body_length,
-                         output_buffer, sizeof(output_buffer));
+                          (const char**)request.http_params, request.body, request.body_length,
+                          output_buffer, MAX_RESPONSE_SIZE);
     
-    // Create HTTP response
-    int content_length = strlen(output_buffer);
-    snprintf(response, sizeof(response),
-             "HTTP/1.1 200 OK\r\n"
-             "Content-Type: text/plain\r\n"
-             "Content-Length: %d\r\n"
-             "Connection: close\r\n"
-             "\r\n%s", content_length, output_buffer);
+    // Find actual length of binary data (not using strlen which stops at null bytes)
+    int out_len = 0;
+    for (int i = MAX_RESPONSE_SIZE - 1; i >= 0; i--) {
+        if (((char*)output_buffer)[i] != '\0') {
+            out_len = i + 1;
+            break;
+        }
+    }
     
-    // Send response
-    if (client->ssl) {
-        SSL_write(client->ssl, response, strlen(response));
+    int hdr_len2 = snprintf(response, MAX_RESPONSE_SIZE,
+        "HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\nContent-Length: %d\r\nConnection: close\r\n\r\n", out_len);
+    if (hdr_len2 < 0 || hdr_len2 >= MAX_RESPONSE_SIZE) { free(output_buffer); goto cleanup_request; }
+    size_t total_len = (size_t)hdr_len2;
+    if (total_len + (size_t)out_len < MAX_RESPONSE_SIZE) {
+        memcpy(response + total_len, output_buffer, out_len);
+        total_len += (size_t)out_len;
     } else {
-        send(client->socket, response, strlen(response), 0);
+        size_t copy_len = MAX_RESPONSE_SIZE - total_len - 1;
+        if (copy_len > 0) { memcpy(response + total_len, output_buffer, copy_len); total_len += copy_len; }
+    }
+    response[total_len] = '\0';
+    if (client->ssl) SSL_write(client->ssl, response, (int)total_len); else send(client->socket, response, total_len, 0);
+    free(output_buffer);
+
+cleanup_request:
+    // Free query strings array
+    if (request.query_strings) { 
+        for (int i = 0; request.query_strings[i]; i++) {
+            free(request.query_strings[i]); 
+        }
+        free(request.query_strings); 
     }
     
-    free_http_request(&request);
+    // Free request body - this IS the body_buffer, safe to free here
+    if (request.body) {
+        free(request.body);
+    }
     
+cleanup_body:
+
+cleanup_free_buffers:
+    free(header_buffer);
+    free(response);
+
 cleanup:
-    // Decrement active connection counter
-    pthread_mutex_lock(&connection_mutex);
-    active_connections--;
-    pthread_mutex_unlock(&connection_mutex);
-    
-    if (client->ssl) {
-        SSL_shutdown(client->ssl);
-        SSL_free(client->ssl);
-    }
+    pthread_mutex_lock(&connection_mutex); active_connections--; pthread_mutex_unlock(&connection_mutex);
+    if (client->ssl) { SSL_shutdown(client->ssl); SSL_free(client->ssl); }
     close(client->socket);
     free(client);
     return NULL;
@@ -387,12 +537,11 @@ cleanup:
 
 // Main server function
 void jetstream_server(void) {
-    int server_socket;
-    struct sockaddr_in server_addr;
-    SSL_CTX* ssl_ctx = NULL;
-    int use_tls = 0;
-    int port;
-
+    struct sockaddr_in server_addr; SSL_CTX* ssl_ctx = NULL; int use_tls = 0; int port;
+    signal(SIGPIPE, SIG_IGN);
+    signal(SIGINT, handle_termination_signal);
+    signal(SIGTERM, handle_termination_signal);
+    srand((unsigned int)(time(NULL) ^ getpid()));
     // Ensure /data directory exists
     if (mkdir(DATA, 0755) < 0 && errno != EEXIST) {
         perror("Failed to create /data directory");
@@ -443,8 +592,8 @@ void jetstream_server(void) {
     }
     
     // Create socket
-    server_socket = socket(AF_INET, SOCK_STREAM, 0);
-    if (server_socket < 0) {
+    server_listen_socket = socket(AF_INET, SOCK_STREAM, 0);
+    if (server_listen_socket < 0) {
         perror("Socket creation failed");
         if (ssl_ctx) SSL_CTX_free(ssl_ctx);
         return;
@@ -452,7 +601,7 @@ void jetstream_server(void) {
     
     // Set socket options
     int opt = 1;
-    setsockopt(server_socket, SOL_SOCKET, SO_REUSEADDR, &opt, sizeof(opt));
+    setsockopt(server_listen_socket, SOL_SOCKET, SO_REUSEADDR, &opt, sizeof(opt));
     
     // Bind socket
     memset(&server_addr, 0, sizeof(server_addr));
@@ -460,17 +609,17 @@ void jetstream_server(void) {
     server_addr.sin_addr.s_addr = INADDR_ANY;
     server_addr.sin_port = htons(port);
     
-    if (bind(server_socket, (struct sockaddr*)&server_addr, sizeof(server_addr)) < 0) {
+    if (bind(server_listen_socket, (struct sockaddr*)&server_addr, sizeof(server_addr)) < 0) {
         perror("Bind failed");
-        close(server_socket);
+        close(server_listen_socket);
         if (ssl_ctx) SSL_CTX_free(ssl_ctx);
         return;
     }
     
     // Listen for connections
-    if (listen(server_socket, 10) < 0) {
+    if (listen(server_listen_socket, 10) < 0) {
         perror("Listen failed");
-        close(server_socket);
+        close(server_listen_socket);
         if (ssl_ctx) SSL_CTX_free(ssl_ctx);
         return;
     }
@@ -478,12 +627,14 @@ void jetstream_server(void) {
     printf("Jetstream server listening on port %d (%s)\n", port, use_tls ? "HTTPS" : "HTTP");
     
     // Accept connections
-    while (1) {
+    while (!stop_flag) {
         struct sockaddr_in client_addr;
         socklen_t client_len = sizeof(client_addr);
-        int client_socket = accept(server_socket, (struct sockaddr*)&client_addr, &client_len);
+        int client_socket = accept(server_listen_socket, (struct sockaddr*)&client_addr, &client_len);
         
+        if (stop_flag) break; // Exit loop if shutting down
         if (client_socket < 0) {
+            if (stop_flag) break;
             perror("Accept failed");
             continue;
         }
@@ -493,7 +644,7 @@ void jetstream_server(void) {
         if (active_connections >= MAX_CONCURRENT_CONNECTIONS) {
             pthread_mutex_unlock(&connection_mutex);
             close(client_socket);
-            continue;
+            continue;  // No increment, so no decrement needed
         }
         active_connections++;
         pthread_mutex_unlock(&connection_mutex);
@@ -514,26 +665,46 @@ void jetstream_server(void) {
         
         if (use_tls) {
             client->ssl = SSL_new(ssl_ctx);
-            SSL_set_fd(client->ssl, client_socket);
-            if (SSL_accept(client->ssl) <= 0) {
-                SSL_free(client->ssl);
-                close(client_socket);
+            if (!client->ssl) {
                 free(client);
-                // Decrement counter on SSL failure
                 pthread_mutex_lock(&connection_mutex);
                 active_connections--;
                 pthread_mutex_unlock(&connection_mutex);
+                close(client_socket);
+                continue;
+            }
+            SSL_set_fd(client->ssl, client_socket);
+            if (SSL_accept(client->ssl) <= 0) {
+                SSL_free(client->ssl);
+                free(client);
+                pthread_mutex_lock(&connection_mutex);
+                active_connections--;
+                pthread_mutex_unlock(&connection_mutex);
+                close(client_socket);
                 continue;
             }
         }
         
         // Handle client in separate thread
         pthread_t thread;
-        pthread_create(&thread, NULL, handle_client, client);
+        int rc = pthread_create(&thread, NULL, handle_client, client);
+        if (rc != 0) {
+            // Failed to start thread
+            if (client->ssl) {
+                SSL_shutdown(client->ssl);
+                SSL_free(client->ssl);
+            }
+            close(client->socket);
+            free(client);
+            pthread_mutex_lock(&connection_mutex);
+            active_connections--;
+            pthread_mutex_unlock(&connection_mutex);
+            continue;
+        }
         pthread_detach(thread);
     }
     
-    close(server_socket);
+    if (server_listen_socket >= 0) close(server_listen_socket);
     if (ssl_ctx) SSL_CTX_free(ssl_ctx);
 }
 
@@ -558,8 +729,10 @@ int find_take_parameter(const char** query_strings) {
 void* watchdog_thread(void* arg) {
     (void)arg; // Suppress unused parameter warning
     
-    while (1) {
+    while (!stop_flag) {
         sleep(WATCHDOG_TIMEOUT);
+        
+        if (stop_flag) break;  // Check again after sleep
         
         DIR* dir = opendir(DATA);
         if (!dir) {
@@ -676,29 +849,8 @@ void jetstream_volatile(const char* path, const char** query_strings, const char
                        const char** http_params, const void* input_buffer, size_t input_size,
                        void* output_buffer, size_t output_size) {
     char filepath[512];
-    
-    // Validate inputs
-    if (!path || !method || !output_buffer || output_size == 0) {
-        if (output_buffer && output_size > 0) {
-            ((char*)output_buffer)[0] = '\0';
-        }
-        return;
-    }
-    
-    // Validate path format: must be /sha256.dat where sha256 is 64 hex characters
-    if (strlen(path) != 69 || path[0] != '/' || strcmp(path + 65, ".dat") != 0) {
-        ((char*)output_buffer)[0] = '\0';
-        return;
-    }
-    
-    // Validate that the middle part is 64 hex characters
-    for (int i = 1; i <= 64; i++) {
-        char c = path[i];
-        if (!((c >= '0' && c <= '9') || (c >= 'a' && c <= 'f') || (c >= 'A' && c <= 'F'))) {
-            ((char*)output_buffer)[0] = '\0';
-            return;
-        }
-    }
+    if (!path || !method || !output_buffer || output_size == 0) { if (output_buffer && output_size > 0) ((char*)output_buffer)[0] = '\0'; return; }
+    if (!is_valid_sha256_path(path)) { ((char*)output_buffer)[0] = '\0'; return; }
     
     // Find format parameter for response formatting
     const char* format_template = find_format_parameter(query_strings);
@@ -851,7 +1003,10 @@ void jetstream_volatile(const char* path, const char** query_strings, const char
                 close(fd);
                 
                 if (bytes_read >= 0) {
-                    ((char*)output_buffer)[bytes_read] = '\0';
+                    // Clear any remaining bytes in the buffer for binary data handling
+                    if (bytes_read < (ssize_t)(output_size - 1)) {
+                        memset((char*)output_buffer + bytes_read, 0, output_size - 1 - bytes_read);
+                    }
                     // Check if content is a write channel, return empty string if so
                     if (strncmp((char*)output_buffer, "Write channel /", 15) == 0) {
                         ((char*)output_buffer)[0] = '\0';
@@ -1024,7 +1179,7 @@ void jetstream_nonvolatile(const char* path, const char** query_strings, const c
         
     } else if (strcmp(method, "DELETE") == 0) {
         // For DELETE, check if file exists and hash matches path
-        if (!path || strlen(path) != 69 || path[0] != '/' || strcmp(path + 65, ".dat") != 0) {
+        if (!is_valid_sha256_path(path)) {
             jetstream_volatile(path, query_strings, method, http_params, input_buffer, input_size, output_buffer, output_size);
             return;
         }
@@ -1099,9 +1254,9 @@ void jetstream_restore(const char* path, const char** query_strings, const char*
             int indices[NUM_BACKUP_IPS];
             for (int i = 0; i < NUM_BACKUP_IPS; i++) indices[i] = i;
             
-            // Simple shuffle
+            // Simple shuffle (thread-safe random)
             for (int i = NUM_BACKUP_IPS - 1; i > 0; i--) {
-                int j = rand() % (i + 1);
+                int j = safe_rand_range(i + 1);
                 int temp = indices[i];
                 indices[i] = indices[j];
                 indices[j] = temp;
@@ -1122,34 +1277,9 @@ void jetstream_restore(const char* path, const char** query_strings, const char*
                 
                 CURL* curl = curl_easy_init();
                 if (!curl) continue;
-                
-                // Set up response buffer
                 struct curl_response response = {0};
-                
-                // Callback to write response data
-                size_t write_callback(void* contents, size_t size, size_t nmemb, void* userp) {
-                    size_t realsize = size * nmemb;
-                    struct curl_response* mem = (struct curl_response*)userp;
-                    
-                    void* ptr = realloc(mem->data, mem->size + realsize + 1);
-                    if (!ptr) {
-                        // Out of memory
-                        free(mem->data);
-                        mem->data = NULL;
-                        mem->size = 0;
-                        return 0;
-                    }
-                    
-                    mem->data = ptr;
-                    memcpy(&(mem->data[mem->size]), contents, realsize);
-                    mem->size += realsize;
-                    mem->data[mem->size] = 0;
-                    
-                    return realsize;
-                }
-                
                 curl_easy_setopt(curl, CURLOPT_URL, url);
-                curl_easy_setopt(curl, CURLOPT_WRITEFUNCTION, write_callback);
+                curl_easy_setopt(curl, CURLOPT_WRITEFUNCTION, curl_write_cb);
                 curl_easy_setopt(curl, CURLOPT_WRITEDATA, &response);
                 curl_easy_setopt(curl, CURLOPT_TIMEOUT, 10L);
                 
@@ -1451,8 +1581,9 @@ void jetstream_application(const char* path, const char** query_strings, const c
                     
                     // If read channel target failed and we got empty result, try restore
                     if (((char*)output_buffer)[0] == '\0' && difftime(time(NULL), startup_time) < WATCHDOG_TIMEOUT) {
-                        char restore_buffer[MAX_RESPONSE_SIZE];
-                        memset(restore_buffer, 0, sizeof(restore_buffer));
+                        char* restore_buffer = malloc(MAX_RESPONSE_SIZE);
+                        if (!restore_buffer) return;
+                        memset(restore_buffer, 0, MAX_RESPONSE_SIZE);
                         jetstream_restore(target_path, query_strings, method, http_params, input_buffer, input_size, restore_buffer, sizeof(restore_buffer));
                         
                         if (strlen(restore_buffer) > 0) {
@@ -1460,6 +1591,7 @@ void jetstream_application(const char* path, const char** query_strings, const c
                             memcpy(output_buffer, restore_buffer, copy_size);
                             ((char*)output_buffer)[copy_size] = '\0';
                         }
+                        free(restore_buffer);
                     }
                     // Do NOT call format_response_path - return the target file content directly
                 }
@@ -1471,6 +1603,9 @@ void jetstream_application(const char* path, const char** query_strings, const c
 int main(int argc, char *argv[]) {
     // Set startup time
     startup_time = time(NULL);
+
+    // Seed PRNG once
+    srand((unsigned int)(startup_time ^ getpid()));
 
     // Initialize cURL globally for multi-threaded use
     if (curl_global_init(CURL_GLOBAL_DEFAULT) != CURLE_OK) {

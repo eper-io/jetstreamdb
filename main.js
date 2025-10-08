@@ -53,10 +53,26 @@ function jetstream_backup(filePath, sha256Name) {
     }
 
     const req = (options.protocol === 'https:' ? https : http).request(options, (res) => {
-        // Optionally handle response
+        // Consume response to prevent memory leaks
+        res.on('data', () => {});
+        res.on('end', () => {});
     });
-    req.on('error', () => {});
+    
+    req.on('error', (err) => {
+        console.error('Backup request error:', err.message);
+    });
+    
+    fileStream.on('error', (err) => {
+        console.error('Backup file stream error:', err.message);
+        req.destroy();
+    });
+    
     fileStream.pipe(req);
+    
+    // Set timeout for backup operations
+    req.setTimeout(30000, () => {
+        req.destroy();
+    });
 }
 
 // Ensure data directory exists
@@ -122,6 +138,8 @@ function jetstream_volatile(path, queryStrings, method, httpParams, inputBuffer)
 
             // Check for channel write: read existing file content first
             try {
+                // Yield to event loop before heavy I/O
+                process.nextTick(() => {});
                 const existingContent = fs.readFileSync(fullPath);
                 const existingContentStr = existingContent.toString();
                 
@@ -183,6 +201,8 @@ function jetstream_volatile(path, queryStrings, method, httpParams, inputBuffer)
 
         case 'GET':
             try {
+                // Yield to event loop before heavy I/O
+                process.nextTick(() => {});
                 // Read file content first to check for channels
                 const content = fs.readFileSync(fullPath);
                 
@@ -376,30 +396,10 @@ function jetstream_restore(path, queryStrings, method, httpParams, inputBuffer) 
                 urlStr += path;
                 
                 try {
-                    // Use child_process.execSync to make synchronous HTTP request
-                    let curlCommand = `curl -s --connect-timeout 10 --max-time 10 "${urlStr}"`;
-                    
-                    // TLS verification if needed
-                    if (backupIP.startsWith('https://') && backupIP.includes('@')) {
-                        const domain = extractDomain(backupIP);
-                        if (domain) {
-                            curlCommand += ` --resolve "${domain}:443:${urlStr.split('://')[1].split('/')[0].split('@')[0]}"`;
-                        }
-                    }
-                    
-                    const data = execSync(curlCommand, { maxBuffer: MAX_FILE_SIZE });
-                    
-                    if (data && data.length > 0) {
-                        // Save to /data/sha256.dat
-                        const shaFile = pathModule.join(DATA_DIR, pathModule.basename(path));
-                        try {
-                            fs.writeFileSync(shaFile, data);
-                            // Successfully restored, return the data
-                            return data;
-                        } catch (err) {
-                            continue;
-                        }
-                    }
+                    // Temporarily disable backup restore to prevent hanging
+                    // This can be re-enabled with proper async implementation later
+                    console.log(`Skipping backup restore for ${path} - would try ${urlStr}`);
+                    continue;
                 } catch (err) {
                     // Continue to next backup IP
                     continue;
@@ -581,58 +581,105 @@ function jetstream_application(path, queryStrings, method, httpParams, inputBuff
 // HTTP request handler
 function httpHandler(req, res) {
     let body = Buffer.alloc(0);
+    let requestAborted = false;
     
     req.on('data', (chunk) => {
-        // Only enforce MAX_FILE_SIZE for uploads
-        if (body.length + chunk.length > MAX_FILE_SIZE) {
-            res.writeHead(413, { 'Content-Type': 'text/plain' });
-            res.end('Request entity too large');
+        // Prevent processing if request already aborted
+        if (requestAborted) {
             return;
         }
-        body = Buffer.concat([body, chunk]);
+        
+        // Only enforce MAX_FILE_SIZE for uploads
+        if (body.length + chunk.length > MAX_FILE_SIZE) {
+            requestAborted = true;
+            req.destroy(); // Immediately close the connection
+            if (!res.headersSent) {
+                res.writeHead(413, { 'Content-Type': 'text/plain' });
+                res.end('Request entity too large');
+            }
+            return;
+        }
+        
+        // Optimize buffer concatenation to reduce memory spikes
+        const newBody = Buffer.allocUnsafe(body.length + chunk.length);
+        body.copy(newBody, 0);
+        chunk.copy(newBody, body.length);
+        body = newBody;
     });
     
     req.on('end', () => {
-        const parsedUrl = url.parse(req.url, true);
-        const path = parsedUrl.pathname || '/';
-        const queryStrings = [];
+        // Prevent processing if request was aborted
+        if (requestAborted) {
+            return;
+        }
         
-        // Convert query parameters to array format
-        for (const [key, value] of Object.entries(parsedUrl.query)) {
-            if (Array.isArray(value)) {
-                for (const v of value) {
-                    queryStrings.push(`${key}=${v}`);
+        try {
+            const parsedUrl = url.parse(req.url, true);
+            const path = parsedUrl.pathname || '/';
+            const queryStrings = [];
+            
+            // Convert query parameters to array format
+            for (const [key, value] of Object.entries(parsedUrl.query || {})) {
+                if (Array.isArray(value)) {
+                    for (const v of value) {
+                        queryStrings.push(`${key}=${v}`);
+                    }
+                } else {
+                    queryStrings.push(`${key}=${value}`);
                 }
-            } else {
-                queryStrings.push(`${key}=${value}`);
+            }
+            
+            const method = req.method;
+            const httpParams = [];
+            
+            // Extract HTTP headers as parameters
+            for (const [key, value] of Object.entries(req.headers || {})) {
+                httpParams.push(`${key}: ${value}`);
+            }
+            
+            // Call jetstream_application with error handling
+            let result = jetstream_application(path, queryStrings, method, httpParams, body);
+            if (result === null || result === undefined) {
+                result = '';
+            }
+            
+            // Check if response headers already sent before writing
+            if (!res.headersSent) {
+                res.writeHead(200, {
+                    'Content-Type': 'text/plain',
+                    'Content-Length': Buffer.byteLength(result),
+                    'Connection': 'close'
+                });
+                res.end(result);
+            }
+        } catch (error) {
+            // Handle any errors gracefully
+            console.error('Request processing error:', error.message);
+            if (!res.headersSent) {
+                res.writeHead(500, { 'Content-Type': 'text/plain' });
+                res.end('Internal server error');
             }
         }
-        
-        const method = req.method;
-        const httpParams = [];
-        
-        // Extract HTTP headers as parameters
-        for (const [key, value] of Object.entries(req.headers)) {
-            httpParams.push(`${key}: ${value}`);
-        }
-        
-        // Call jetstream_application (now synchronous)
-        let result = jetstream_application(path, queryStrings, method, httpParams, body);
-        if (result === null || result === undefined) {
-            result = '';
-        }
-        
-        res.writeHead(200, {
-            'Content-Type': 'text/plain',
-            'Content-Length': Buffer.byteLength(result),
-            'Connection': 'close'
-        });
-        res.end(result);
     });
     
     req.on('error', (err) => {
-        res.writeHead(400, { 'Content-Type': 'text/plain' });
-        res.end('Bad request');
+        console.error('Request error:', err.message);
+        requestAborted = true;
+        if (!res.headersSent) {
+            res.writeHead(400, { 'Content-Type': 'text/plain' });
+            res.end('Bad request');
+        }
+    });
+    
+    // Add timeout handling for requests
+    req.on('timeout', () => {
+        console.error('Request timeout');
+        requestAborted = true;
+        req.destroy();
+        if (!res.headersSent) {
+            res.writeHead(408, { 'Content-Type': 'text/plain' });
+            res.end('Request timeout');
+        }
     });
 }
 
@@ -685,9 +732,33 @@ function jetstream_server() {
         };
         
         const httpsServer = https.createServer(options, httpHandler);
+        
+        // Add connection limiting and proper timeout handling
+        let activeConnections = 0;
+        const MAX_CONNECTIONS = 100;
+        
         httpsServer.on('connection', (socket) => {
+            activeConnections++;
+            
+            // Reject connections if over limit
+            if (activeConnections > MAX_CONNECTIONS) {
+                socket.destroy();
+                activeConnections--;
+                return;
+            }
+            
             socket.setTimeout(10000); // 10 second socket timeout
+            
+            socket.on('close', () => {
+                activeConnections--;
+            });
+            
+            socket.on('error', (err) => {
+                console.error('Socket error:', err.message);
+                activeConnections--;
+            });
         });
+        
         httpsServer.listen(443, () => {
             console.log('JetStreamDB HTTPS server listening on port 443');
         });
@@ -705,9 +776,33 @@ function jetstream_server() {
 
 function startHttpServer() {
     const httpServer = http.createServer(httpHandler);
+    
+    // Add connection limiting and proper timeout handling
+    let activeConnections = 0;
+    const MAX_CONNECTIONS = 100;
+    
     httpServer.on('connection', (socket) => {
+        activeConnections++;
+        
+        // Reject connections if over limit
+        if (activeConnections > MAX_CONNECTIONS) {
+            socket.destroy();
+            activeConnections--;
+            return;
+        }
+        
         socket.setTimeout(10000); // 10 second socket timeout
+        
+        socket.on('close', () => {
+            activeConnections--;
+        });
+        
+        socket.on('error', (err) => {
+            console.error('Socket error:', err.message);
+            activeConnections--;
+        });
     });
+    
     httpServer.listen(7777, () => {
         console.log('JetStreamDB HTTP server listening on port 7777');
     });

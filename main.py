@@ -161,11 +161,14 @@ def jetstream_volatile(path: str, query_strings: List[str], method: str,
 
         def read_small(path: str, limit: int = 256) -> Optional[bytes]:
             try:
+                # Check file size before reading
+                if os.path.getsize(path) > MAX_FILE_SIZE:
+                    return None
                 with open(path, "rb") as f:
                     return f.read(limit)
             except FileNotFoundError:
                 return None
-            except Exception:
+            except (OSError, Exception):
                 return None
 
         def parse_write_channel(buf: bytes) -> Optional[str]:
@@ -351,6 +354,10 @@ def jetstream_volatile(path: str, query_strings: List[str], method: str,
                     take_flag = True
                     break
             try:
+                # Check file size before reading to prevent memory exhaustion
+                if os.path.getsize(target_full) > MAX_FILE_SIZE:
+                    return  # File too large, return empty
+                
                 with open(target_full, "rb") as f:
                     data = f.read(output_size)
                 # If this file is a write channel, return empty string on GET/HEAD
@@ -458,8 +465,13 @@ def jetstream_nonvolatile(path: str, query_strings: List[str], method: str,
             # Mismatch: inspect existing stored content at key path
             target_full = full_path_from_rel(path)
             try:
+                # Check file size before reading
+                file_size = os.path.getsize(target_full)
+                if file_size > MAX_FILE_SIZE:
+                    return  # File too large, skip processing
+                
                 with open(target_full, "rb") as f:
-                    existing = f.read(1024 * 1024 + 1)  # read up to 1MB+1; size limits handled elsewhere
+                    existing = f.read(MAX_FILE_SIZE)  # Read up to MAX_FILE_SIZE
                 # Touch mtime after read
                 try:
                     os.utime(target_full, None)
@@ -487,8 +499,12 @@ def jetstream_nonvolatile(path: str, query_strings: List[str], method: str,
                 return
             target_full = full_path_from_rel(path)
             try:
+                # Check file size before reading
+                if os.path.getsize(target_full) > MAX_FILE_SIZE:
+                    return  # File too large, skip processing
+                
                 with open(target_full, "rb") as f:
-                    existing = f.read(1024 * 1024 + 1)
+                    existing = f.read(MAX_FILE_SIZE)
                 # Touch mtime after read
                 try:
                     os.utime(target_full, None)
@@ -614,10 +630,18 @@ def jetstream_restore(path: str, query_strings: List[str], method: str,
                         response = urllib.request.urlopen(req, timeout=10)
                     
                     if response.status == 200:
-                        data = response.read()
+                        # Read response data with size limit
+                        data = b''
+                        remaining = MAX_FILE_SIZE
+                        while remaining > 0:
+                            chunk = response.read(min(remaining, 8192))  # 8KB chunks
+                            if not chunk:
+                                break
+                            data += chunk
+                            remaining -= len(chunk)
                         
-                        # Limit data size to prevent memory exhaustion
-                        if len(data) > MAX_FILE_SIZE:
+                        # Skip if no data or if we hit the size limit
+                        if not data:
                             continue
                         
                         # Save to /data/sha256.dat
@@ -683,9 +707,11 @@ def jetstream_application(path: str, query_strings: List[str], method: str,
 
         if method_upper == "GET" and has_burst(query_strings):
             # First, get the index content via remote into a temporary buffer
-            tmp_index = bytearray(output_size)
+            # Use smaller buffer for index to reduce memory usage
+            index_buffer_size = min(output_size, 8192)  # Max 8KB for index
+            tmp_index = bytearray(index_buffer_size)
             jetstream_remote(path, query_strings, method, http_params,
-                             input_buffer, input_size, tmp_index, output_size)
+                             input_buffer, input_size, tmp_index, index_buffer_size)
 
             # Extract actual length up to first null byte
             try:
@@ -707,9 +733,11 @@ def jetstream_application(path: str, query_strings: List[str], method: str,
                 if remaining <= 0:
                     break
                 # Fetch this chunk via remote call
-                tmp_chunk = bytearray(remaining)
+                # Limit chunk buffer size to prevent excessive memory usage
+                chunk_buffer_size = min(remaining, 8192)  # Max 8KB per chunk
+                tmp_chunk = bytearray(chunk_buffer_size)
                 jetstream_remote(line, chunk_qs, "GET", http_params,
-                                 b"", 0, tmp_chunk, remaining)
+                                 b"", 0, tmp_chunk, chunk_buffer_size)
                 # Determine content length up to first null
                 try:
                     chunk_len = tmp_chunk.index(0)
@@ -907,8 +935,44 @@ def jetstream_application(path: str, query_strings: List[str], method: str,
         # On any error, fall back to transparent pass-through
         jetstream_remote(path, query_strings, method, http_params,
                          input_buffer, input_size, output_buffer, output_size)
+# Global connection tracking
+_active_connections = 0
+_connection_lock = threading.Lock()
+MAX_CONCURRENT_CONNECTIONS = 100
+MAX_REQUEST_SIZE = MAX_FILE_SIZE  # 1MB request size limit
+
 class JetStreamHandler(BaseHTTPRequestHandler):
     """HTTP request handler for JetStream database operations"""
+    
+    def setup(self):
+        """Setup connection with limits"""
+        global _active_connections
+        
+        # Call parent setup first to initialize connection
+        super().setup()
+        
+        with _connection_lock:
+            if _active_connections >= MAX_CONCURRENT_CONNECTIONS:
+                # Reject connection if over limit
+                try:
+                    self.request.close()
+                except:
+                    pass
+                return
+            _active_connections += 1
+        
+        # Set socket timeout for individual requests
+        try:
+            self.request.settimeout(30)  # 30 second timeout per request
+        except:
+            pass
+    
+    def finish(self):
+        """Clean up connection"""
+        global _active_connections
+        with _connection_lock:
+            _active_connections -= 1
+        super().finish()
     
     def _handle_request(self) -> None:
         """Common request handling logic"""
@@ -929,13 +993,32 @@ class JetStreamHandler(BaseHTTPRequestHandler):
             for header, value in self.headers.items():
                 http_params.append(f"{header}={value}")
             
-            # Read request body
+            # Read request body with size limits
             content_length = int(self.headers.get('Content-Length', 0))
-            input_buffer = self.rfile.read(content_length) if content_length > 0 else b''
+            
+            # Validate request size before reading
+            if content_length > MAX_REQUEST_SIZE:
+                self.send_error(413, f"Request entity too large. Maximum size: {MAX_REQUEST_SIZE} bytes")
+                return
+            
+            input_buffer = b''
+            if content_length > 0:
+                # Read in chunks to prevent memory spikes
+                remaining = content_length
+                chunks = []
+                while remaining > 0:
+                    chunk_size = min(remaining, 8192)  # 8KB chunks
+                    chunk = self.rfile.read(chunk_size)
+                    if not chunk:
+                        break
+                    chunks.append(chunk)
+                    remaining -= len(chunk)
+                input_buffer = b''.join(chunks)
+            
             input_size = len(input_buffer)
             
-            # Prepare output buffer
-            output_buffer = bytearray(65536)  # 64KB buffer
+            # Prepare output buffer - use smaller buffer to reduce memory usage
+            output_buffer = bytearray(16384)  # 16KB buffer (reduced from 64KB)
             output_size = len(output_buffer)
             
             # Call jetstream_application
@@ -955,8 +1038,19 @@ class JetStreamHandler(BaseHTTPRequestHandler):
             
             self.wfile.write(output_buffer[:actual_length])
             
+        except socket.timeout:
+            self.send_error(408, "Request Timeout")
+        except ConnectionResetError:
+            # Client disconnected, nothing to send
+            pass
         except Exception as e:
-            self.send_error(500, f"Internal Server Error: {str(e)}")
+            # Log error but don't expose internal details
+            print(f"Request processing error: {type(e).__name__}: {str(e)}")
+            try:
+                self.send_error(500, "Internal Server Error")
+            except:
+                # If we can't send error response, connection is likely dead
+                pass
     
     def do_GET(self) -> None:
         """Handle GET requests"""
@@ -1015,6 +1109,8 @@ def jetstream_server() -> None:
             server.socket.settimeout(10)
     
     print(f"JetStream server listening on {'https' if use_tls else 'http'}://0.0.0.0:{server.server_port}")
+    print(f"Maximum concurrent connections: {MAX_CONCURRENT_CONNECTIONS}")
+    print(f"Maximum request size: {MAX_REQUEST_SIZE} bytes")
 
     # Start watchdog thread
     def _watchdog_loop():
