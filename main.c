@@ -638,6 +638,13 @@ void jetstream_server(void) {
             perror("Accept failed");
             continue;
         }
+
+        // Set a timeout on the socket BEFORE the SSL handshake to prevent hangs
+        struct timeval timeout;
+        timeout.tv_sec = 10; // 10-second timeout for handshake and subsequent I/O
+        timeout.tv_usec = 0;
+        setsockopt(client_socket, SOL_SOCKET, SO_RCVTIMEO, (const char*)&timeout, sizeof(timeout));
+        setsockopt(client_socket, SOL_SOCKET, SO_SNDTIMEO, (const char*)&timeout, sizeof(timeout));
         
         // Check connection limit
         pthread_mutex_lock(&connection_mutex);
@@ -675,6 +682,8 @@ void jetstream_server(void) {
             }
             SSL_set_fd(client->ssl, client_socket);
             if (SSL_accept(client->ssl) <= 0) {
+                // Handshake failed or timed out
+                ERR_print_errors_fp(stderr); // Log OpenSSL errors
                 SSL_free(client->ssl);
                 free(client);
                 pthread_mutex_lock(&connection_mutex);
